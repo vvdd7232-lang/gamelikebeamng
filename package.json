@@ -5,12 +5,14 @@
   "type": "commonjs",
   "scripts": {
     "start": "node serve.js 8080",
-    "test": "node tests/physics_test.mjs && node tests/skinning_test.mjs && node tests/render_smoke.mjs",
+    "test": "node tests/physics_test.mjs && node tests/skinning_test.mjs && node tests/node_texture_test.mjs && node tests/shader_contract_test.mjs && node tests/render_smoke.mjs",
     "convert": "python3 tools/fbx2glb.py Tesla_Model_S_game.fbx game/assets/tesla.glb",
     "cage": "python3 tools/gen_body_nodes.py",
     "test:physics": "node tests/physics_test.mjs",
     "test:skin": "node tests/skinning_test.mjs",
-    "test:render": "node tests/render_smoke.mjs"
+    "test:render": "node tests/render_smoke.mjs",
+    "test:shaders": "node tests/shader_contract_test.mjs",
+    "test:nodes": "node tests/node_texture_test.mjs"
   },
   "license": "MIT"
 }

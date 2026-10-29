@@ -167,7 +167,7 @@ precision highp float;
 in vec3 vWorld;
 in vec3 vNormal;
 in vec3 vColor;
-in vec2 vMat;
+in vec3 vMat;   // x = metallic, y = roughness, z = emissive flag (must match MESH_VS)
 out vec4 fragColor;
 
 uniform float uAlpha;

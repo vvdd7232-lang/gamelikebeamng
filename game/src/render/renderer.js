@@ -6,7 +6,44 @@ import { mat4, v3, clamp } from '../core/math.js';
 import { MATERIALS } from '../world/terrain.js';
 
 const SHADOW_SIZE = 2048;
-const MAX_NODES = 320;
+export const MAX_NODES = 320;
+
+/**
+ * Pack the soft-body nodes into the GPU node texture.
+ *
+ * The texture is MAX_NODES wide and 5 tall, so **node j lives in column j** and
+ * the shaders read it with `texelFetch(uNodeTex, ivec2(j, row), 0)`:
+ *
+ *   row 0 -> world position of the node
+ *   row 1 -> column 0 of the node's local rotation D
+ *   row 2 -> column 1
+ *   row 3 -> column 2
+ *   row 4 -> rest (bind) world position
+ *
+ * `gl.texSubImage2D` fills row-major, hence the `row * maxNodes + i` indexing;
+ * writing the nodes as 5 consecutive texels instead (row-major per node) would
+ * silently scramble every vertex on the GPU.
+ */
+export function packNodeData(vehicle, out, maxNodes = MAX_NODES) {
+  const n = Math.min(vehicle.nodeCount, maxNodes);
+  const pos = vehicle.body.pos;
+  const rest = vehicle.restWorld;
+  const tex = vehicle.nodeTex;          // 16 floats per node: columns of D at +4, +8, +12
+  for (let i = 0; i < n; i++) {
+    const t = i * 16;
+    let o = i * 4;
+    out[o] = pos[i * 3]; out[o + 1] = pos[i * 3 + 1]; out[o + 2] = pos[i * 3 + 2]; out[o + 3] = 1;
+    o = (maxNodes + i) * 4;
+    out[o] = tex[t + 4]; out[o + 1] = tex[t + 5]; out[o + 2] = tex[t + 6]; out[o + 3] = 0;
+    o = (maxNodes * 2 + i) * 4;
+    out[o] = tex[t + 8]; out[o + 1] = tex[t + 9]; out[o + 2] = tex[t + 10]; out[o + 3] = 0;
+    o = (maxNodes * 3 + i) * 4;
+    out[o] = tex[t + 12]; out[o + 1] = tex[t + 13]; out[o + 2] = tex[t + 14]; out[o + 3] = 0;
+    o = (maxNodes * 4 + i) * 4;
+    out[o] = rest[i * 3]; out[o + 1] = rest[i * 3 + 1]; out[o + 2] = rest[i * 3 + 2]; out[o + 3] = 1;
+  }
+  return n;
+}
 
 export class Renderer {
   constructor(canvas) {
@@ -359,28 +396,8 @@ export class Renderer {
   }
 
   updateVehicleNodes(vehicle, inst) {
-    const n = Math.min(vehicle.nodeCount, MAX_NODES);
-    const data = inst.nodeData;
-    const pos = vehicle.body.pos;
-    const rest = vehicle.restWorld;
-    const tex = vehicle.nodeTex;    // row per node: delta(3), 3x3 rotation(12)
-    const R = [
-      [1, 0, 0], [0, 1, 0], [0, 0, 1],
-    ];
-    for (let i = 0; i < n; i++) {
-      const o = i * 20;
-      const t = i * 16;
-      // position
-      data[o] = pos[i * 3]; data[o + 1] = pos[i * 3 + 1]; data[o + 2] = pos[i * 3 + 2]; data[o + 3] = 1;
-      // rotation columns (tex holds rows of R)
-      data[o + 4] = tex[t + 4]; data[o + 5] = tex[t + 8]; data[o + 6] = tex[t + 12]; data[o + 7] = 0;
-      data[o + 8] = tex[t + 5]; data[o + 9] = tex[t + 9]; data[o + 10] = tex[t + 13]; data[o + 11] = 0;
-      data[o + 12] = tex[t + 6]; data[o + 13] = tex[t + 10]; data[o + 14] = tex[t + 14]; data[o + 15] = 0;
-      // rest world position
-      data[o + 16] = rest[i * 3]; data[o + 17] = rest[i * 3 + 1]; data[o + 18] = rest[i * 3 + 2]; data[o + 19] = 1;
-    }
-    void R;
-    this.vehicleInstances.get(vehicle).dirty = true;
+    packNodeData(vehicle, inst.nodeData);
+    inst.dirty = true;
   }
 
   uploadNodeTexture(vehicle, inst) {
