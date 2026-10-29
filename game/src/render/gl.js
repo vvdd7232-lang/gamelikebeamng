@@ -51,14 +51,32 @@ export function createProgram(gl, vsSrc, fsSrc, name = 'program') {
   return { program: p, uniforms, name };
 }
 
-export function createMesh(gl, layout, data, indices, mode) {
+export function createMesh(gl, layout, data, indices, mode, name = 'mesh') {
   // layout: [{loc, size, stride?, offset?, type?}]; data: interleaved typed array
+  const strideFloats = layout.reduce((s, a) => s + a.size, 0);
+  // The interleaved buffer must hold exactly `strideFloats` per vertex; a
+  // mismatch silently shifts every attribute by a few floats and turns the
+  // geometry into giant random triangles (which is exactly how the terrain
+  // looked before this check existed).
+  if (data.length % strideFloats !== 0) {
+    throw new Error(
+      `mesh "${name}": ${data.length} floats is not a multiple of the ${strideFloats}-float ` +
+      `vertex stride implied by the attribute layout`);
+  }
+  const vertexCount = data.length / strideFloats;
+  if (indices && indices.length) {
+    let maxIndex = 0;
+    for (let i = 0; i < indices.length; i++) if (indices[i] > maxIndex) maxIndex = indices[i];
+    if (maxIndex >= vertexCount) {
+      throw new Error(`mesh "${name}": index ${maxIndex} out of range for ${vertexCount} vertices`);
+    }
+  }
   const vao = gl.createVertexArray();
   gl.bindVertexArray(vao);
   const vbo = gl.createBuffer();
   gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
   gl.bufferData(gl.ARRAY_BUFFER, data, gl.STATIC_DRAW);
-  const stride = layout.reduce((s, a) => s + a.size, 0) * 4;
+  const stride = strideFloats * 4;
   let off = 0;
   for (const a of layout) {
     gl.enableVertexAttribArray(a.loc);
@@ -75,11 +93,12 @@ export function createMesh(gl, layout, data, indices, mode) {
     count = indices.length;
     indexType = indices instanceof Uint16Array ? gl.UNSIGNED_SHORT : gl.UNSIGNED_INT;
   } else {
-    count = data.length / (stride / 4);
+    count = vertexCount;
   }
   gl.bindVertexArray(null);
   return {
-    vao, vbo, ibo, count, indexType, mode: mode || gl.TRIANGLES,
+    name, vao, vbo, ibo, count, indexType, vertexCount, strideFloats,
+    mode: mode || gl.TRIANGLES,
     dispose() {
       gl.deleteVertexArray(vao);
       gl.deleteBuffer(vbo);

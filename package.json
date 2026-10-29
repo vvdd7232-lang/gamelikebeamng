@@ -12,7 +12,8 @@
     "test:skin": "node tests/skinning_test.mjs",
     "test:render": "node tests/render_smoke.mjs",
     "test:shaders": "node tests/shader_contract_test.mjs",
-    "test:nodes": "node tests/node_texture_test.mjs"
+    "test:nodes": "node tests/node_texture_test.mjs",
+    "mirror": "node tools/mirror_capture.mjs /tmp/mirror && echo \"now run: .venv/bin/python tools/mirror_shade.py /tmp/mirror /tmp/frame.png\""
   },
   "license": "MIT"
 }

@@ -129,7 +129,9 @@ export class Renderer {
     const N = world.gridN;
     const c = world.cell;
     const h0 = -world.halfSize;
-    const STRIDE = 13; // pos3 nrm3 col3 mat3 (metal, rough, emis)
+    // pos3 nrm3 col3 mat3 (metal, rough, emis) -- keep in sync with the
+    // vertex attribute layout below (4 attributes x 3 floats = 12)
+    const STRIDE = 12;
     const verts = new Float32Array(N * N * STRIDE);
     const nrm = [0, 1, 0];
     for (let j = 0; j < N; j++) {
@@ -150,10 +152,9 @@ export class Renderer {
         verts[o + 6] = mat.color[0] * shade;
         verts[o + 7] = mat.color[1] * shade * (1 + n2 * 0.25);
         verts[o + 8] = mat.color[2] * shade;
-        verts[o + 9] = 0.0;
+        verts[o + 9] = mat.metal || 0.0;
         verts[o + 10] = mat.rough;
         verts[o + 11] = 0.0;
-        verts[o + 12] = 0.0;
       }
     }
     const indices = new Uint32Array((N - 1) * (N - 1) * 6);
@@ -168,7 +169,7 @@ export class Renderer {
     if (this.terrain) this.terrain.dispose();
     this.terrain = createMesh(gl,
       [{ loc: 0, size: 3 }, { loc: 1, size: 3 }, { loc: 2, size: 3 }, { loc: 3, size: 3 }],
-      verts, indices);
+      verts, indices, null, 'terrain');
 
     this.uploadProps(world);
   }
@@ -334,18 +335,19 @@ export class Renderer {
       }
     }
 
-    const verts = new Float32Array(pos.length / 3 * 13);
+    const STRIDE = 12; // same layout as the terrain: 4 x vec3
+    const verts = new Float32Array(pos.length / 3 * STRIDE);
     for (let i = 0; i < pos.length / 3; i++) {
-      const o = i * 13;
+      const o = i * STRIDE;
       verts[o] = pos[i * 3]; verts[o + 1] = pos[i * 3 + 1]; verts[o + 2] = pos[i * 3 + 2];
       verts[o + 3] = nrm[i * 3]; verts[o + 4] = nrm[i * 3 + 1]; verts[o + 5] = nrm[i * 3 + 2];
       verts[o + 6] = col[i * 3]; verts[o + 7] = col[i * 3 + 1]; verts[o + 8] = col[i * 3 + 2];
-      verts[o + 9] = mat[i * 3]; verts[o + 10] = mat[i * 3 + 1]; verts[o + 11] = 0; verts[o + 12] = 0;
+      verts[o + 9] = mat[i * 3]; verts[o + 10] = mat[i * 3 + 1]; verts[o + 11] = 0;
     }
     if (this.props) this.props.dispose();
     this.props = createMesh(gl,
       [{ loc: 0, size: 3 }, { loc: 1, size: 3 }, { loc: 2, size: 3 }, { loc: 3, size: 3 }],
-      verts, new Uint32Array(idx));
+      verts, new Uint32Array(idx), null, 'props');
   }
 
   // -------------------------------------------------------------------- cars
@@ -358,7 +360,7 @@ export class Renderer {
     this.carGeometry = { bodies: [], wheels: {} };
     for (const prim of geom.bodies) {
       this.carGeometry.bodies.push({
-        mesh: createMesh(gl, layout, prim.data, prim.indices || null, gl.TRIANGLES),
+        mesh: createMesh(gl, layout, prim.data, prim.indices || null, gl.TRIANGLES, 'body:' + prim.name),
         emissive: prim.emissive,
         name: prim.name,
       });
@@ -367,7 +369,7 @@ export class Renderer {
       const prims = [];
       for (const p of w.prims) {
         prims.push({
-          mesh: createMesh(gl, layout, p.data, p.indices || null, gl.TRIANGLES),
+          mesh: createMesh(gl, layout, p.data, p.indices || null, gl.TRIANGLES, 'wheel:' + w.name),
           emissive: p.emissive,
         });
       }
