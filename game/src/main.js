@@ -88,7 +88,25 @@ async function main() {
 
   const clock = { last: performance.now(), acc: 0, frames: 0, fpsTime: 0, fps: 60, slow: 0, fast: 0 };
   let cageLines = null;
+  let hitPower = 0;
   const cageVerts = new Float32Array(20000 * 4);
+
+  /**
+   * Crash test: drop the player on the approach run of the test pad and fire it
+   * at the concrete barrier.  Makes the crumple zones easy to demo without
+   * driving around looking for something to hit.
+   */
+  function crashTest(v = player, kmh = 92) {
+    // 30 m of concrete in front of the barrier on the test pad
+    const spawn = { position: [225, world.heightAt(225, 285), 285], yaw: Math.PI };
+    const nv = new Vehicle(world, { spawn, isPlayer: v.isPlayer, name: v.name, color: v.color });
+    Object.assign(v, nv);
+    const vel = kmh / 3.6;
+    for (let i = 0; i < v.nodeCount; i++) v.body.vel[i * 3 + 2] = -vel;
+    effects.clearFor(v.name);
+    camera.snap(v, world);
+    hud.toast(`crash test · ${Math.round(kmh)} km/h`);
+  }
 
   function resetCar(v = player, usePad = false) {
     if (usePad) {
@@ -122,10 +140,9 @@ async function main() {
     const b = v.body;
     let n = 0;
     for (let i = 0; i < b.nb && n < 19990; i++) {
-      if (b.bbroken[i]) continue;
+      // torn beams are still attached by their tether: draw them fully red
       const a = b.ba[i] * 3, c = b.bb[i] * 3;
-      // x = damage of the beam, renderer tints stressed beams hot
-      const dmg = b.bdmg[i];
+      const dmg = b.bbroken[i] ? 1.4 : b.bdmg[i];
       for (const o of [a, c]) {
         cageVerts[n * 4] = b.pos[o]; cageVerts[n * 4 + 1] = b.pos[o + 1]; cageVerts[n * 4 + 2] = b.pos[o + 2];
         cageVerts[n * 4 + 3] = dmg;
@@ -170,12 +187,10 @@ async function main() {
       effects.reset();
     }
     if (input.consume('KeyP')) resetCar(player, true);
+    if (input.consume('KeyK')) crashTest(player);
     if (input.consume('KeyC')) {
       state.cameraMode = (state.cameraMode + 1) % CAMERA_MODES.length;
-      camera.mode = CAMERA_MODES[state.cameraMode];
-      camera.yaw = 0;
-      camera.dist = camera.mode === 'hood' ? 8.2 : 8.2;
-      camera.autoOrbit = 0;
+      camera.setMode(CAMERA_MODES[state.cameraMode]);
       hud.toast(`camera: ${camera.mode}`);
     }
     if (input.consume('KeyG')) state.debugCage = !state.debugCage;
@@ -190,25 +205,28 @@ async function main() {
     if (dt > 0) {
       player.step(dt, inp);
       for (const ai of ais) ai.update(dt);
+      // grab the strongest hit of this frame before the effects drain the queue
+      hitPower = 0;
+      for (const imp of player.impacts) hitPower = Math.max(hitPower, imp.power);
       for (const v of cars) {
         if (!v.isPlayer) v.step(dt, v.lastInput || { throttle: 0, brake: 0, steer: 0, handbrake: 0 });
         const detached = v.takeDetachedWheels();
         for (const d of detached) {
-          for (let i = 0; i < 12; i++) {
+          for (let i = 0; i < 16; i++) {
             effects.spawnParticle(d.pos[0], d.pos[1], d.pos[2],
-              (Math.random() - 0.5) * 3, Math.random() * 2, (Math.random() - 0.5) * 3,
-              0.5 + Math.random(), 0.4, [0.5, 0.5, 0.5], -3, 1);
+              (Math.random() - 0.5) * 4, Math.random() * 3, (Math.random() - 0.5) * 4,
+              0.5 + Math.random(), 0.35, [0.55, 0.55, 0.56], -3, 1);
           }
+          if (v.isPlayer) hud.toast('wheel torn off', 1200);
         }
       }
-      effects.carEffects(player, dt, player.speed);
-      for (const v of cars) if (!v.isPlayer) effects.carEffects(v, dt, v.speed);
+      for (const v of cars) effects.carEffects(v, dt, v.speed);
       effects.update(dt);
       if (state.debugCage) updateCageLines(player);
     }
 
-    // camera shake on impacts
-    if (player.impactFlash > 0.7) camera.shake = Math.min(1.2, camera.shake + 0.45);
+    // camera shake on impacts: driven by how hard the hit actually was
+    if (hitPower > 0.12) camera.shake = Math.min(1.4, camera.shake + hitPower * 0.9);
     camera.update(Math.max(dtRaw, 0.0001), player, input, world);
 
     renderer.setEnv({});
@@ -218,11 +236,17 @@ async function main() {
     });
 
     hud.update({
+      dt: dtRaw,
       speed: Math.abs(player.forwardSpeed) * 3.6,
       power: player.throttle,
       brake: player.brake,
       damage: player.damage,
+      zones: player.damageZones,
+      cabin: player.cabinIntegrity,
+      powerScale: player.powerScale,
       wheelDamage: player.wheelDamage,
+      wheelRim: player.wheels.map((w) => w.detached ? 1 : (w.rimDamage || 0)),
+      impact: hitPower > 0.1 ? player.lastImpactSpeed : 0,
       gears: 1,
       fps: clock.fps,
       airborne: player.airborne,

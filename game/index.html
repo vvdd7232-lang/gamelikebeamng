@@ -46,10 +46,45 @@
     </div>
   </div>
 
+  <div id="impact-banner" class="hidden"><b id="impact-kmh">0</b><span>km/h impact</span></div>
+
   <div id="damage">
-    <div class="label">DAMAGE</div>
-    <div class="dmg-track"><div id="damage-bar" class="dmg-fill"></div></div>
-    <div id="damage-val">0%</div>
+    <div class="label">VEHICLE DAMAGE</div>
+    <div class="dmg-body">
+      <div class="dmg-car">
+        <svg id="car-dmg" viewBox="0 0 100 200">
+          <defs>
+            <clipPath id="car-clip">
+              <path d="M50 3 C70 3 82 14 85 34 L88 72 L89 130 C89 156 84 178 76 190 C70 197 62 198 50 198 C38 198 30 197 24 190 C16 178 11 156 11 130 L12 72 L15 34 C18 14 30 3 50 3 Z" />
+            </clipPath>
+          </defs>
+          <g clip-path="url(#car-clip)">
+            <rect class="zone" id="zn-0" x="10" y="0" width="40" height="70" />
+            <rect class="zone" id="zn-1" x="50" y="0" width="40" height="70" />
+            <rect class="zone" id="zn-2" x="10" y="70" width="40" height="65" />
+            <rect class="zone" id="zn-3" x="50" y="70" width="40" height="65" />
+            <rect class="zone" id="zn-4" x="10" y="135" width="40" height="65" />
+            <rect class="zone" id="zn-5" x="50" y="135" width="40" height="65" />
+          </g>
+          <path class="car-outline" d="M50 3 C70 3 82 14 85 34 L88 72 L89 130 C89 156 84 178 76 190 C70 197 62 198 50 198 C38 198 30 197 24 190 C16 178 11 156 11 130 L12 72 L15 34 C18 14 30 3 50 3 Z" />
+          <path class="car-glass" d="M24 62 L30 36 C33 25 40 20 50 20 C60 20 67 25 70 36 L76 62 Z" />
+          <path class="car-glass" d="M25 128 L75 128 L72 152 C70 166 64 174 50 174 C36 174 30 166 28 152 Z" />
+          <g class="wheels">
+            <rect id="wh-FL" x="4" y="36" width="9" height="22" rx="3" />
+            <rect id="wh-FR" x="87" y="36" width="9" height="22" rx="3" />
+            <rect id="wh-RL" x="4" y="142" width="9" height="22" rx="3" />
+            <rect id="wh-RR" x="87" y="142" width="9" height="22" rx="3" />
+          </g>
+        </svg>
+      </div>
+      <div class="dmg-stats">
+        <div class="stat"><b id="damage-val">0%</b><span>structure</span></div>
+        <div class="stat"><b id="cabin-val">100%</b><span>cabin</span></div>
+        <div class="stat"><b id="engine-val">100%</b><span>power</span></div>
+        <div class="stat"><b id="wheels-val">4/4</b><span>wheels</span></div>
+      </div>
+    </div>
+    <div id="wheel-damage" class="warn"></div>
   </div>
 
   <div id="help">
@@ -58,6 +93,7 @@
       <tr><td><kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> / arrows</td><td>drive</td></tr>
       <tr><td><kbd>Space</kbd></td><td>handbrake</td></tr>
       <tr><td><kbd>R</kbd></td><td>repair &amp; respawn on road</td></tr>
+      <tr><td><kbd>K</kbd></td><td>crash test: launch at the wall</td></tr>
       <tr><td><kbd>P</kbd></td><td>respawn on the test pad</td></tr>
       <tr><td><kbd>C</kbd></td><td>camera mode (chase / orbit / hood)</td></tr>
       <tr><td><kbd>T</kbd> hold</td><td>slow motion</td></tr>
@@ -66,7 +102,7 @@
       <tr><td><kbd>H</kbd></td><td>hide this panel</td></tr>
       <tr><td>mouse drag / wheel</td><td>orbit / zoom</td></tr>
     </table>
-    <p class="tip">Hit the concrete walls on the test pad (follow the road, they are marked) at full speed — the body crumples, beams break and wheels can come off.</p>
+    <p class="tip"><kbd>K</kbd> relaunches the car at the concrete barrier on the test pad. The crumple zones fold, the safety cell holds, the paint flakes off and the wheels come off if you hit it hard enough.</p>
   </div>
 </div>
 

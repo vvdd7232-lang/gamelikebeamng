@@ -302,8 +302,11 @@ export class World {
     this.colliders = [];
     const g = (x, z) => this.heightAt(x, z);
     // --- crash test walls near the pad
-    this.addBox(PAD.x - 40, PAD.y + 1.0, PAD.z + 30, 14, 1.0, 0.45, 0.0);
-    this.addBox(PAD.x + 20, PAD.y + 1.0, PAD.z - 42, 0.45, 1.0, 16, 0.0);
+    // 3 m thick: a 120 km/h hit moves the cage 9 cm per substep, and a thin
+    // wall let the front clip punch through to the far side and get ejected
+    // forwards -- which tore the car in half instead of crumpling it
+    this.addBox(PAD.x - 40, PAD.y + 1.5, PAD.z + 30, 14, 1.5, 3.0, 0.0);
+    this.addBox(PAD.x + 20, PAD.y + 1.5, PAD.z - 42, 3.0, 1.5, 16, 0.0);
     // --- ramps (pitch is negative so the car drives up towards +z)
     this.addBox(PAD.x - 10, PAD.y + 0.75, PAD.z + 20, 6, 0.16, 9, 0.0, -0.16);
     this.addBox(PAD.x + 25, PAD.y + 0.9, PAD.z + 18, 5, 0.16, 8, 0.35, -0.20);

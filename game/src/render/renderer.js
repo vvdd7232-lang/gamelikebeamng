@@ -29,16 +29,22 @@ export function packNodeData(vehicle, out, maxNodes = MAX_NODES) {
   const pos = vehicle.body.pos;
   const rest = vehicle.restWorld;
   const tex = vehicle.nodeTex;          // 16 floats per node: columns of D at +4, +8, +12
+  const nodeDamage = vehicle.body.nodeDamage;
+  const nodeCrumple = vehicle.body.nodeCrumple;
   for (let i = 0; i < n; i++) {
     const t = i * 16;
     let o = i * 4;
-    out[o] = pos[i * 3]; out[o + 1] = pos[i * 3 + 1]; out[o + 2] = pos[i * 3 + 2]; out[o + 3] = 1;
+    // .w of the position row = damage of this node (read by MESH_VS)
+    out[o] = pos[i * 3]; out[o + 1] = pos[i * 3 + 1]; out[o + 2] = pos[i * 3 + 2];
+    out[o + 3] = nodeDamage ? nodeDamage[i] : 0;
     o = (maxNodes + i) * 4;
     out[o] = tex[t + 4]; out[o + 1] = tex[t + 5]; out[o + 2] = tex[t + 6]; out[o + 3] = 0;
     o = (maxNodes * 2 + i) * 4;
     out[o] = tex[t + 8]; out[o + 1] = tex[t + 9]; out[o + 2] = tex[t + 10]; out[o + 3] = 0;
     o = (maxNodes * 3 + i) * 4;
-    out[o] = tex[t + 12]; out[o + 1] = tex[t + 13]; out[o + 2] = tex[t + 14]; out[o + 3] = 0;
+    // .w of the third rotation column = crumple of this node
+    out[o] = tex[t + 12]; out[o + 1] = tex[t + 13]; out[o + 2] = tex[t + 14];
+    out[o + 3] = nodeCrumple ? nodeCrumple[i] : 0;
     o = (maxNodes * 4 + i) * 4;
     out[o] = rest[i * 3]; out[o + 1] = rest[i * 3 + 1]; out[o + 2] = rest[i * 3 + 2]; out[o + 3] = 1;
   }
@@ -430,6 +436,17 @@ export class Renderer {
   }
 
   updateVehicleNodes(vehicle, inst) {
+    // A respawn (R / P / crash test) swaps the car's spawn pose in place.  The
+    // bind transform lives in the renderer instance, so it has to be refreshed
+    // or the skinned body would keep drawing at the previous spawn point.
+    const p = vehicle.spawnPos;
+    if (inst.bindPos[0] !== p[0] || inst.bindPos[1] !== p[1] || inst.bindPos[2] !== p[2]) {
+      inst.bindPos = p.slice();
+      const R0 = vehicle.R0;
+      inst.bindRot[0] = R0[0]; inst.bindRot[1] = R0[3]; inst.bindRot[2] = R0[6];
+      inst.bindRot[3] = R0[1]; inst.bindRot[4] = R0[4]; inst.bindRot[5] = R0[7];
+      inst.bindRot[6] = R0[2]; inst.bindRot[7] = R0[5]; inst.bindRot[8] = R0[8];
+    }
     packNodeData(vehicle, inst.nodeData);
     inst.dirty = true;
   }
@@ -495,8 +512,16 @@ export class Renderer {
       const m = inst.wheelMats.get(w.name);
       if (!m) continue;
       if (w.detached) {
-        mat4.identity(m);
-        m[0] = m[5] = m[10] = 0; // hide
+        // a wheel that came off keeps flying: place it by its own free-body
+        // state (position + tumbling quaternion) instead of hiding it
+        quatToMat4(w.quat || [0, 0, 0, 1], m);
+        const c = Math.cos(w.spin || 0), sn = Math.sin(w.spin || 0);
+        const r0 = [m[0], m[1], m[2]], r1 = [m[4], m[5], m[6]], r2 = [m[8], m[9], m[10]];
+        for (let k = 0; k < 3; k++) {
+          m[4 + k] = r1[k] * c + r2[k] * sn;
+          m[8 + k] = r2[k] * c - r1[k] * sn;
+        }
+        m[12] = w.pos[0]; m[13] = w.pos[1]; m[14] = w.pos[2];
         continue;
       }
       const fwd = [basis.z[0], basis.z[1], basis.z[2]];
@@ -524,10 +549,16 @@ export class Renderer {
       };
       const Y1 = rotAbout(Y0, l2, c2, s2);
       const Z1 = rotAbout(Z0, l2, c2, s2);
+      // a bent rim / flat tyre squats: squash the wheel along the body up axis
+      const flat = 1 - 0.22 * clamp(w.rimDamage || 0, 0, 1) * (w.contact ? 1 : 0.35);
+      const Y2 = [Y1[0] * flat, Y1[1] * flat, Y1[2] * flat];
       m[0] = l2[0]; m[1] = l2[1]; m[2] = l2[2]; m[3] = 0;
-      m[4] = Y1[0]; m[5] = Y1[1]; m[6] = Y1[2]; m[7] = 0;
+      m[4] = Y2[0]; m[5] = Y2[1]; m[6] = Y2[2]; m[7] = 0;
       m[8] = Z1[0]; m[9] = Z1[1]; m[10] = Z1[2]; m[11] = 0;
-      m[12] = w.pos[0]; m[13] = w.pos[1]; m[14] = w.pos[2]; m[15] = 1;
+      m[12] = w.pos[0] - Y1[0] * (1 - flat) * 0.32;
+      m[13] = w.pos[1] - Y1[1] * (1 - flat) * 0.32;
+      m[14] = w.pos[2] - Y1[2] * (1 - flat) * 0.32;
+      m[15] = 1;
     }
   }
 
@@ -666,6 +697,7 @@ export class Renderer {
     gl.uniform1i(u.uShadows, 1);
     gl.uniform1f(u.uAlpha, 1.0);
     gl.uniform3f(u.uEmissive, 0, 0, 0);
+    if (u.uTint) gl.uniform3f(u.uTint, 1, 1, 1);
     gl.activeTexture(gl.TEXTURE1);
     gl.bindTexture(gl.TEXTURE_2D, this.shadowTex);
     gl.uniform1i(u.uShadowMap, 1);
@@ -703,6 +735,7 @@ export class Renderer {
         gl.activeTexture(gl.TEXTURE1);
         gl.bindTexture(gl.TEXTURE_2D, this.shadowTex);
         gl.uniform1i(u.uNodeCount, vehicle.nodeCount);
+        if (u.uTint) gl.uniform3fv(u.uTint, vehicle.color || [1, 1, 1]);
         if (!skinnable) gl.uniformMatrix4fv(u.uModel, false, this.rigidBodyMatrix(vehicle));
         gl.uniformMatrix3fv(u.uBindRot, false, inst.bindRot);
         gl.uniform3fv(u.uBindPos, inst.bindPos);
@@ -715,7 +748,9 @@ export class Renderer {
           gl.drawElements(prim.mesh.mode, prim.mesh.count, prim.mesh.indexType, 0);
         }
         // lights
-        gl.uniform3f(u.uEmissive, 0.9, 0.85, 0.72);
+        // smashed lamp clusters go dark (the shader also fades them locally)
+        const lights = 1 - 0.75 * (vehicle.lightsOut || 0);
+        gl.uniform3f(u.uEmissive, 0.9 * lights, 0.85 * lights, 0.72 * lights);
         for (const prim of this.carGeometry.bodies) {
           if (!prim.emissive) continue;
           gl.bindVertexArray(prim.mesh.vao);
@@ -808,4 +843,18 @@ export class Renderer {
 function normalize(v) {
   const l = Math.hypot(v[0], v[1], v[2]) || 1;
   v[0] /= l; v[1] /= l; v[2] /= l;
+}
+
+/** rigid transform from a unit quaternion (x, y, z, w) -- used for loose wheels */
+export function quatToMat4(q, out) {
+  const x = q[0], y = q[1], z = q[2], w = q[3];
+  const xx = x * x, yy = y * y, zz = z * z;
+  const xy = x * y, xz = x * z, yz = y * z;
+  const wx = w * x, wy = w * y, wz = w * z;
+  const m = out || mat4.create();
+  m[0] = 1 - 2 * (yy + zz); m[1] = 2 * (xy + wz); m[2] = 2 * (xz - wy); m[3] = 0;
+  m[4] = 2 * (xy - wz); m[5] = 1 - 2 * (xx + zz); m[6] = 2 * (yz + wx); m[7] = 0;
+  m[8] = 2 * (xz + wy); m[9] = 2 * (yz - wx); m[10] = 1 - 2 * (xx + yy); m[11] = 0;
+  m[12] = 0; m[13] = 0; m[14] = 0; m[15] = 1;
+  return m;
 }

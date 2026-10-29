@@ -44,8 +44,84 @@ export class Effects {
   }
 
   // ------------------------------------------------------------- car effects
+  /**
+   * Everything that comes off a car when it hits something: sparks off bare
+   * metal, a dust cloud, glass shards, chunks of bodywork, smoke from a torn
+   * engine bay and the odd lick of flame.  Driven by the exact contact points
+   * the solver reports (vehicle.impacts), not by a guess.
+   */
+  impactBurst(vehicle, imp) {
+    const p = imp.power;
+    const n = imp.normal || [0, 1, 0];
+    const px = imp.x, py = imp.y, pz = imp.z;
+    const speed = Math.max(4, vehicle.speed || 0);
+
+    // --- sparks: hot, fast, short lived, flying along the surface
+    const sparkCount = Math.round(4 + p * 30);
+    for (let i = 0; i < sparkCount; i++) {
+      const s = 0.6 + p * 2.2;
+      this.spawnParticle(
+        px + rand(-0.12, 0.12), py + rand(-0.06, 0.2), pz + rand(-0.12, 0.12),
+        (n[0] + rand(-1, 1)) * speed * 0.25 * s,
+        (Math.abs(n[1]) * 0.5 + rand(0.2, 1.4)) * speed * 0.18 * s,
+        (n[2] + rand(-1, 1)) * speed * 0.25 * s,
+        rand(0.18, 0.6), rand(0.05, 0.13),
+        [1.0, rand(0.65, 0.9), rand(0.15, 0.45)], -11.0, 0.5,
+      );
+    }
+    // --- dust / gravel kicked out of the impact
+    const dustCount = Math.round(2 + p * 12);
+    for (let i = 0; i < dustCount; i++) {
+      this.spawnParticle(
+        px + rand(-0.4, 0.4), py + rand(0.0, 0.5), pz + rand(-0.4, 0.4),
+        rand(-2.2, 2.2), rand(0.5, 2.6), rand(-2.2, 2.2),
+        rand(0.8, 2.2), rand(0.3, 0.9),
+        [0.52, 0.5, 0.47], -0.9, 1.5,
+      );
+    }
+    // --- glass shards + bright flakes on harder hits
+    if (p > 0.35 || imp.tear) {
+      const shards = Math.round(p * 14);
+      for (let i = 0; i < shards; i++) {
+        this.spawnParticle(
+          px + rand(-0.5, 0.5), py + rand(-0.1, 0.6), pz + rand(-0.5, 0.5),
+          rand(-3.4, 3.4), rand(0.4, 3.2), rand(-3.4, 3.4),
+          rand(0.5, 1.3), rand(0.04, 0.1),
+          [0.86, 0.92, 1.0], -9.0, 0.5,
+        );
+      }
+      // panels / paint chips (dark flakes tumbling away)
+      for (let i = 0; i < Math.round(p * 10); i++) {
+        this.spawnParticle(
+          px + rand(-0.6, 0.6), py + rand(0.0, 0.7), pz + rand(-0.6, 0.6),
+          rand(-2.6, 2.6), rand(0.6, 2.8), rand(-2.6, 2.6),
+          rand(0.6, 1.6), rand(0.06, 0.16),
+          [0.25, 0.06, 0.06], -9.0, 0.6,
+        );
+      }
+    }
+    // --- smoke column on a heavy hit (the crumple zone venting)
+    if (p > 0.55) {
+      for (let i = 0; i < 6; i++) {
+        this.spawnParticle(
+          px + rand(-0.5, 0.5), py + rand(0.1, 0.8), pz + rand(-0.5, 0.5),
+          rand(-0.7, 0.7), rand(0.8, 2.2), rand(-0.7, 0.7),
+          rand(1.4, 3.0), rand(0.5, 1.2),
+          [0.24, 0.24, 0.25], -0.3, 1.0,
+        );
+      }
+    }
+  }
+
   carEffects(vehicle, dt, speed) {
-    const gl = this.world;
+    // drain the impacts the solver reported this frame
+    if (vehicle.impacts && vehicle.impacts.length) {
+      for (const imp of vehicle.impacts) {
+        if (imp.power > 0.12) this.impactBurst(vehicle, imp);
+      }
+      vehicle.impacts.length = 0;
+    }
+    this.engineEffects(vehicle, dt);
     for (const w of vehicle.wheels) {
       if (w.detached) continue;
       const skid = w.skid || 0;
@@ -74,6 +150,15 @@ export class Effects {
             onHard ? -0.4 : -1.2, 1.1,
           );
         }
+      }
+      // smoke off a flat tyre / bent rim
+      if ((w.rimDamage || 0) > 0.55 && w.contact && speed > 2 && Math.random() < dt * 14) {
+        this.spawnParticle(
+          w.contactPoint[0] + rand(-0.15, 0.15), w.contactPoint[1] + 0.1,
+          w.contactPoint[2] + rand(-0.15, 0.15),
+          rand(-0.4, 0.4), rand(0.4, 1.3), rand(-0.4, 0.4),
+          rand(0.5, 1.4), rand(0.25, 0.6), [0.42, 0.42, 0.43], -0.4, 1.5,
+        );
       }
       // sparks when a wheel is rim-damaged or the body is grinding
       if (w.rimDamage > 0.5 && w.contact && speed > 3 && Math.random() < dt * 30) {
@@ -119,6 +204,34 @@ export class Effects {
       }
     } else if (vehicle.impactFlash < 0.2) {
       vehicle._impactFx = false;
+    }
+  }
+
+  /** smoke, and eventually fire, pouring out of a wrecked front end */
+  engineEffects(vehicle, dt) {
+    const dmg = vehicle.engineDamage || 0;
+    if (dmg < 0.32) return;
+    const bay = vehicle.toWorldPoint([0, 0.62, 1.75]);
+    const heat = clamp((dmg - 0.32) / 0.6, 0, 1);
+    // smoke: continuous while the car is alive
+    if (Math.random() < dt * (6 + heat * 26)) {
+      const dark = 0.11 + heat * 0.06;
+      this.spawnParticle(
+        bay[0] + rand(-0.3, 0.3), bay[1] + rand(0.0, 0.25), bay[2] + rand(-0.3, 0.3),
+        rand(-0.6, 0.6), rand(0.9, 2.4), rand(-0.6, 0.6),
+        rand(1.2, 2.8), rand(0.4, 1.0), [dark, dark, dark * 1.05], 0.2, 0.9,
+      );
+    }
+    // fire only when the bay is really destroyed
+    if (heat > 0.45 && Math.random() < dt * 22) {
+      for (let i = 0; i < 2; i++) {
+        this.spawnParticle(
+          bay[0] + rand(-0.22, 0.22), bay[1] + rand(-0.05, 0.2), bay[2] + rand(-0.22, 0.22),
+          rand(-0.5, 0.5), rand(1.4, 3.4), rand(-0.5, 0.5),
+          rand(0.22, 0.6), rand(0.16, 0.42),
+          [1.0, rand(0.35, 0.7), 0.12], 1.2, 1.2,
+        );
+      }
     }
   }
 

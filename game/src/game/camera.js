@@ -18,6 +18,29 @@ export class Camera {
     this.autoOrbit = 0;
   }
 
+  /**
+   * Chase is a trailer shot, hood sits on the bonnet, and 'orbit' is the crash
+   * inspector: low, close and drifting around the car so the crumpled panels
+   * are actually visible after a hit.
+   */
+  setMode(mode) {
+    this.mode = mode;
+    this.autoOrbit = 0;
+    if (mode === 'orbit') {
+      this.dist = 6.2;
+      this.pitch = 0.16;
+      this.yaw = 0.9;
+    } else if (mode === 'hood') {
+      this.dist = 4.0;
+      this.pitch = 0.05;
+      this.yaw = 0;
+    } else {
+      this.dist = 8.2;
+      this.pitch = 0.22;
+      this.yaw = 0;
+    }
+  }
+
   update(dt, vehicle, input, world) {
     const c = vehicle.center;
     if (input.mouse.wheel) this.dist = clamp(this.dist + input.mouse.wheel * 0.9, 3.2, 26);
@@ -30,7 +53,9 @@ export class Camera {
         // let the camera trail behind the car
         this.yaw = lerp(this.yaw, 0, clamp(dt * 1.8, 0, 1));
       }
-      this.autoOrbit += dt * (this.mode === 'orbit' ? 0.35 : 0);
+      // slow orbit around a stopped/ wrecked car, normal trailing otherwise
+      const orbitRate = Math.abs(vehicle.forwardSpeed) < 4 ? 0.30 : 0.12;
+      this.autoOrbit += dt * (this.mode === 'orbit' ? orbitRate : 0);
     }
 
     const basis = vehicle.basis;

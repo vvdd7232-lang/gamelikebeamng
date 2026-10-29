@@ -193,7 +193,14 @@ const geom = buildCarGeometry(glb, probe.cage.nodes);
 renderer.uploadWorld(world);
 renderer.uploadCar(geom);
 
-const player = new Vehicle(world, { spawn: world.spawnOnTrack(0.015), isPlayer: true });
+// SCENARIO=crash throws the car into the barrier on the test pad at
+// IMPACT=<km/h>; the default scenario just drives down the road.
+const scenario = process.env.SCENARIO || (process.env.IDLE === '1' ? 'idle' : 'drive');
+const CRASH_SPAWN = { position: [225, world.heightAt(225, 285), 285], yaw: 0 }; // facing the pad barrier at z = 315
+const player = new Vehicle(world, {
+  spawn: scenario === 'crash' ? CRASH_SPAWN : world.spawnOnTrack(0.015),
+  isPlayer: true,
+});
 renderer.createVehicleInstance(player);
 const camera = new Camera();
 camera.dist = Number(process.env.CAM_DIST || 7.5);
@@ -201,15 +208,37 @@ camera.pitch = Number(process.env.CAM_PITCH || 0.18);
 camera.yaw = Number(process.env.CAM_YAW || 0.9);
 const effects = new Effects(world);
 
-const seconds = Number(process.env.DRIVE || 2.5);
-const idle = process.env.IDLE === '1';       // no throttle: reproduce a "parked" frame
-const steps = Math.round(seconds * 60);
-for (let i = 0; i < steps; i++) {
-  const throttle = idle ? 0 : 1;
-  player.step(1 / 60, { throttle, brake: 0, steer: i > steps * 0.7 ? 0.5 : 0, handbrake: 0 });
-  for (const d of player.takeDetachedWheels()) { void d; }
-  effects.carEffects(player, 1 / 60, player.speed);
-  effects.update(1 / 60);
+const INPUT_IDLE = { throttle: 0, brake: 0, steer: 0, handbrake: 0 };
+let steps = 1;
+if (scenario === 'crash') {
+  // settle on the pad, launch at the barrier, then let the wreck come to rest
+  for (let i = 0; i < 90; i++) player.step(1 / 60, INPUT_IDLE);
+  const v = Number(process.env.IMPACT || 60) / 3.6;
+  for (let i = 0; i < player.nodeCount; i++) {
+    player.body.vel[i * 3] = 0;
+    player.body.vel[i * 3 + 1] = 0;
+    player.body.vel[i * 3 + 2] = v;
+  }
+  const crashSeconds = Number(process.env.CRASH_T || 2.6);
+  steps = Math.round(crashSeconds * 60);
+  for (let i = 0; i < steps; i++) {
+    player.step(1 / 60, INPUT_IDLE);
+    for (const d of player.takeDetachedWheels()) { void d; }
+    effects.carEffects(player, 1 / 60, player.speed);
+    effects.update(1 / 60);
+  }
+  camera.dist = Number(process.env.CAM_DIST || 6.5);
+} else {
+  const seconds = Number(process.env.DRIVE || 2.5);
+  const idle = scenario === 'idle';         // no throttle: reproduce a "parked" frame
+  steps = Math.round(seconds * 60);
+  for (let i = 0; i < steps; i++) {
+    const throttle = idle ? 0 : 1;
+    player.step(1 / 60, { throttle, brake: 0, steer: i > steps * 0.7 ? 0.5 : 0, handbrake: 0 });
+    for (const d of player.takeDetachedWheels()) { void d; }
+    effects.carEffects(player, 1 / 60, player.speed);
+    effects.update(1 / 60);
+  }
 }
 if (process.env.DETACH === '1') { for (const w of player.wheels) player.detachWheel(w); }
 camera.snap(player, world);

@@ -124,10 +124,14 @@ out vec3 vWorld;
 out vec3 vNormal;
 out vec3 vColor;
 out vec3 vMat;
+out float vDamage;    // 0..1 how damaged the cage is around this vertex
+out float vCrumple;   // 0..1 how far the sheet metal has been folded
 
 void main() {
   vec3 p = aPos;
   vec3 n = aNormal;
+  float damage = 0.0;
+  float crumple = 0.0;
   if (uSkinned == 1) {
     vec3 bind = uBindRot * aPos + uBindPos;   // world position in the bind pose
     vec3 acc = vec3(0.0);
@@ -138,13 +142,18 @@ void main() {
       float w = aWeights[i];
       if (w <= 0.0) continue;
       if (j < 0 || j >= uNodeCount) continue;
-      vec3 nodePos = texelFetch(uNodeTex, ivec2(j, 0), 0).xyz;
+      vec4 nodeTexel = texelFetch(uNodeTex, ivec2(j, 0), 0);
+      vec3 nodePos = nodeTexel.xyz;
       mat3 D = mat3(texelFetch(uNodeTex, ivec2(j, 1), 0).xyz,
                     texelFetch(uNodeTex, ivec2(j, 2), 0).xyz,
                     texelFetch(uNodeTex, ivec2(j, 3), 0).xyz);
       vec3 restW = texelFetch(uNodeTex, ivec2(j, 4), 0).xyz;
       acc += w * (nodePos + D * (bind - restW));
       accD += D * w;
+      // .w of the position row carries the node damage, .w of the third
+      // rotation column carries the crumple (see packNodeData)
+      damage += w * nodeTexel.w;
+      crumple += w * texelFetch(uNodeTex, ivec2(j, 3), 0).w;
     }
     p = acc;
     n = (accD * uBindRot) * aNormal;
@@ -159,6 +168,8 @@ void main() {
   vNormal = n;
   vColor = aColor;
   vMat = aMat;
+  vDamage = damage;
+  vCrumple = crumple;
 }
 `;
 
@@ -167,15 +178,46 @@ precision highp float;
 in vec3 vWorld;
 in vec3 vNormal;
 in vec3 vColor;
-in vec3 vMat;   // x = metallic, y = roughness, z = emissive flag (must match MESH_VS)
+in vec3 vMat;   // x = metallic, y = roughness, z = surface kind (must match MESH_VS)
+in float vDamage;
+in float vCrumple;
 out vec4 fragColor;
 
 uniform float uAlpha;
 uniform vec3 uEmissive;
+uniform vec3 uTint;       // per-car paint colour
 ${COMMON_LIGHT}
+
+// surface kinds written by the mesh builder into aMat.z
+const int KIND_PAINT = 0;    // generic metal / plastic / trim
+const int KIND_LIGHT = 1;    // lamp lens (emissive)
+const int KIND_GLASS = 2;    // windows
+const int KIND_CARPAINT = 3; // painted body panel, tinted per car
 
 vec3 aces(vec3 x) {
   return clamp((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14), 0.0, 1.0);
+}
+
+float dHash(vec3 p) {
+  p = fract(p * 0.3183099 + vec3(0.71, 0.113, 0.419));
+  p *= 17.0;
+  return fract(p.x * p.y * p.z * (p.x + p.y + p.z));
+}
+
+float dNoise(vec3 x) {
+  vec3 i = floor(x);
+  vec3 f = fract(x);
+  f = f * f * (3.0 - 2.0 * f);
+  return mix(mix(mix(dHash(i + vec3(0, 0, 0)), dHash(i + vec3(1, 0, 0)), f.x),
+                 mix(dHash(i + vec3(0, 1, 0)), dHash(i + vec3(1, 1, 0)), f.x), f.y),
+             mix(mix(dHash(i + vec3(0, 0, 1)), dHash(i + vec3(1, 0, 1)), f.x),
+                 mix(dHash(i + vec3(0, 1, 1)), dHash(i + vec3(1, 1, 1)), f.x), f.y), f.z);
+}
+
+float dFbm(vec3 p) {
+  float v = 0.0, a = 0.5;
+  for (int i = 0; i < 4; i++) { v += a * dNoise(p); p *= 2.03; a *= 0.5; }
+  return v;
 }
 
 void main() {
@@ -185,6 +227,82 @@ void main() {
   float metal = clamp(vMat.x, 0.0, 1.0);
   float rough = clamp(vMat.y, 0.04, 1.0);
   vec3 base = vColor;
+  int kind = int(vMat.z + 0.5);
+  if (kind == KIND_CARPAINT) base *= uTint;
+  float dmg = clamp(vDamage, 0.0, 1.0);
+  float fold = clamp(vCrumple, 0.0, 1.0);
+  vec3 emissive = uEmissive;
+
+  // windows are tinted glass, not chrome: drop the metal, darken the tint and
+  // soften the mirror so the windscreen reflects the sky instead of turning
+  // into a sheet of white plastic at grazing angles
+  if (kind == KIND_GLASS) {
+    metal = 0.0;
+    rough = 0.18;
+    base *= 0.30;
+  }
+
+  // ---------------------------------------------------------------- damage
+  // The cage hands us per-vertex damage and crumple; turn that into the things
+  // you actually see on a crashed car: hammered panels, paint flaking off to
+  // bare metal, soot, stone chips on the nose and a spider web of cracks in the
+  // glass.
+  if (dmg > 0.005 || fold > 0.005) {
+    float gain = clamp(dmg * 0.75 + fold * 0.65, 0.0, 1.0);
+    if (kind == KIND_GLASS) {
+      // cracks are the contours of a noise field -- reads as a spider web
+      vec3 gp = vWorld * 7.0;
+      float n1 = dFbm(gp);
+      float web = 1.0 - smoothstep(0.0, 0.05, abs(n1 - 0.5));
+      float n2 = dFbm(gp * 2.7 + 11.0);
+      web = max(web, (1.0 - smoothstep(0.0, 0.03, abs(n2 - 0.5))) * 0.75);
+      web *= smoothstep(0.18, 0.7, gain);
+      // fractured glass frosts over before it goes opaque
+      base = mix(base, vec3(0.52, 0.57, 0.61), clamp((gain - 0.35) * 0.45, 0.0, 0.30));
+      base = mix(base, vec3(0.80, 0.85, 0.88), web * 0.55);
+      metal = mix(metal, 0.0, web);
+      rough = mix(rough, 0.66, web * 0.85);
+      // and eventually falls out: punch holes through the pane so you can see
+      // the cabin instead of a white sheet
+      float holeNoise = dFbm(vWorld * 11.0 + 31.0);
+      float holes = smoothstep(0.40, 0.55, gain) * smoothstep(0.50, 0.58, holeNoise);
+      if (holes > 0.5) discard;
+      // shattered glass throws the sun around
+      N = normalize(N + (vec3(dNoise(vWorld * 60.0), dNoise(vWorld * 60.0 + 7.0), dNoise(vWorld * 60.0 + 19.0)) - 0.5) * web * 0.8);
+    } else {
+      // hammered / folded sheet metal: the normals get knocked about so the
+      // crushed area catches the light in dents and creases
+      float dent = dFbm(vWorld * 9.0) - 0.5;
+      vec3 dentN = vec3(dNoise(vWorld * 23.0), dNoise(vWorld * 23.0 + 13.0), dNoise(vWorld * 23.0 + 29.0)) - 0.5;
+      N = normalize(N + dentN * (0.55 + dent) * fold * 2.0);
+      // flaking paint: the high-frequency noise eats through the clear coat and
+      // exposes bare aluminium; a dark line at the edge of every chip reads as
+      // the lip of lifted paint
+      float chip = dFbm(vWorld * 14.0 + 3.0) * 0.72 + dFbm(vWorld * 46.0) * 0.28;
+      float chipEdge = 0.58 - gain * 0.22;
+      float chipMask = smoothstep(chipEdge, chipEdge + 0.06, chip) * clamp(gain * 1.15, 0.0, 0.76);
+      float lip = smoothstep(chipEdge - 0.07, chipEdge, chip) * (1.0 - smoothstep(chipEdge, chipEdge + 0.03, chip));
+      vec3 bareMetal = vec3(0.27, 0.285, 0.30);
+      base = mix(base, bareMetal, chipMask);
+      base *= 1.0 - lip * 0.55 * clamp(gain, 0.0, 1.0);
+      metal = mix(metal, 0.52, chipMask);
+      rough = mix(rough, 0.62, chipMask);
+      // scratches: thin streaks that stay inside the damaged area
+      float streak = dFbm(vec3(vWorld.x * 90.0, vWorld.y * 3.0, vWorld.z * 90.0) + 7.0);
+      float scratch = smoothstep(0.62, 0.70, streak) * clamp(gain * 1.2, 0.0, 0.85);
+      base = mix(base, vec3(0.42, 0.43, 0.44), scratch * 0.6);
+      rough = mix(rough, 0.55, scratch);
+      // soot / grime around the damage, and a general dulling of the paint
+      float soot = smoothstep(0.42, 1.0, dFbm(vWorld * 3.1) * 0.55 + gain);
+      base *= mix(1.0, 0.38, soot * 0.75);
+      rough = mix(rough, 0.95, soot * 0.6);
+      // a crushed panel never stays mirror-flat
+      rough = mix(rough, 0.8, fold * 0.55);
+      metal = mix(metal, 0.1, fold * 0.4);
+    }
+    // a smashed light unit goes dark
+    if (kind == KIND_LIGHT) emissive *= (1.0 - 0.92 * clamp(gain * 1.3, 0.0, 1.0));
+  }
 
   float ndl = max(dot(N, uSunDir), 0.0);
   float sh = shadowFactor(vWorld);
@@ -209,13 +327,16 @@ void main() {
   vec3 envDiff = skyRadiance(N) * 0.55;
 
   vec3 ambient = albedo * envDiff + albedo * uGroundColor * 0.12 * (1.0 - N.y * 0.5);
+  // a dark glass tint still picks up a little of the sky it faces
+  if (kind == KIND_GLASS) ambient += envDiff * 0.05;
   vec3 direct = albedo * uSunColor * ndl * sh * 1.9;
   vec3 specDirect = spec * uSunColor * sh;
 
   float fres = pow(1.0 - ndv, 5.0);
-  vec3 specEnv = env * (F0 + fres * (1.0 - rough)) * (0.35 + 0.65 * pow(1.0 - rough, 2.0));
+  vec3 specEnv = env * (F0 + fres * (1.0 - rough)) * (0.30 + 0.55 * pow(1.0 - rough, 2.0));
+  if (kind == KIND_GLASS) specEnv *= 1.9;
 
-  vec3 col = ambient + direct + specDirect + specEnv * mix(0.35, 1.0, sh) + uEmissive;
+  vec3 col = ambient + direct + specDirect + specEnv * mix(0.35, 1.0, sh) + emissive;
 
   // fog
   float dist = length(uCamPos - vWorld);

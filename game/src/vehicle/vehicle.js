@@ -162,7 +162,28 @@ export class Vehicle {
     this.forwardSpeed = 0;
     this.yawRate = 0;
     this.wheelSpinFast = 0;
+
+    // ---------------------------------------------------------- damage state
+    // `damage` is the share of the shell that has yielded / torn (0..1), the
+    // zones feed the HUD silhouette, the sub-damage values drive the car:
+    // a smashed nose cuts power, a bent front corner pulls the steering, a
+    // damaged wheel loses grip and rides on a flat.
     this.damage = 0;
+    this.structural = 1;
+    this.cabinIntegrity = 1;
+    this.damageZones = new Float64Array(6);   // FL FR ML MR RL RR
+    this.zoneBeams = [[], [], [], [], [], []];
+    this.cabinBeams = [];
+    this.engineDamage = 0;
+    this.steeringDamage = 0;
+    this.steerPull = 0;
+    this.powerScale = 1;
+    this.lightsOut = 0;
+    this.impacts = [];            // drained by the effects system
+    this.detachedProps = [];      // wheels torn off, handed to the effects
+    this.lastImpactSpeed = 0;     // km/h of the last big hit
+    this.impactFlash = 0;
+    this.impactCooldown = 0;
     this.wheelDamage = 0;
     this.airborne = false;
     this.throttle = 0;
@@ -175,9 +196,9 @@ export class Vehicle {
     this.gForce = [0, 0, 0];
     this.accelSmooth = [0, 0, 0];
     this.surfaceMat = 0;
-    this.impactFlash = 0;
     this.lastImpact = 0;
     this.startBraking = 0;
+    this.buildBeamZones();
     this.updateBasis();
     this.updateWheelVisuals(0);
     this.updateNodeTex();
@@ -295,6 +316,8 @@ export class Vehicle {
       this.stepWheels(h);
       this.applyAero(h);
       this.body.step(h, this.world, this.world.colliders);
+      this.drainImpacts();
+      this.updateDetachedWheels(h);
     }
     this.updateBasis();
 
@@ -351,11 +374,15 @@ export class Vehicle {
 
   updateWheelSteer(dt) {
     const speedFactor = 1 - clamp(Math.abs(this.forwardSpeed) / 55, 0, 0.72);
-    const maxSteer = this.spec.maxSteerDeg * Math.PI / 180 * speedFactor;
+    // a bent front corner throws away steering lock and drags the car sideways
+    const steerHealth = 1 - 0.55 * this.steeringDamage;
+    const maxSteer = this.spec.maxSteerDeg * Math.PI / 180 * speedFactor * steerHealth;
     for (const w of this.wheels) {
-      w.steerTarget = w.front ? this.steer * maxSteer : 0;
+      if (w.detached) { w.steerTarget = 0; continue; }
+      const cmd = this.steer * steerHealth + this.steerPull;
+      w.steerTarget = w.front ? cmd * maxSteer : 0;
       const delta = w.steerTarget - w.steer;
-      const maxDelta = this.spec.steerSpeed * dt;
+      const maxDelta = this.spec.steerSpeed * dt * steerHealth;
       w.steer += clamp(delta, -maxDelta, maxDelta);
     }
   }
@@ -370,7 +397,10 @@ export class Vehicle {
     // drivetrain: AWD, 40/60 split, electric torque curve
     const v = Math.abs(this.forwardSpeed);
     const maxForce = Math.min(spec.maxWheelForce, (spec.powerKW * 1000) / Math.max(v, 6));
-    const damageFactor = 1 - clamp(this.damageRatio() * 0.75, 0, 0.75);
+    // power comes from the front of the car: a smashed nose means a smashed
+    // motor bay, so the throttle fades out instead of the old "lose 10% of
+    // everything" rule
+    const damageFactor = this.powerScale !== undefined ? this.powerScale : 1;
     const drive = this.throttle * maxForce * damageFactor;
     const brakeTotal = this.brake * spec.brakeForce;
 
@@ -402,7 +432,8 @@ export class Vehicle {
       ];
       w.pos[0] = wc[0]; w.pos[1] = wc[1]; w.pos[2] = wc[2];
 
-      const k = w.front ? spec.suspKFront : spec.suspKRear;
+      const rim = w.rimDamage || 0;
+      const k = (w.front ? spec.suspKFront : spec.suspKRear) * (1 - 0.5 * rim);
       let springF = 0;
       // compression rate from the suspension travel itself, then low-passed.
       // Driving it straight off the cage node velocities feeds every cage
@@ -473,7 +504,8 @@ export class Vehicle {
       const mat = MATERIALS[surf.material !== undefined ? surf.material : 1];
       const gripBase = mat.name === 'asphalt' || mat.name === 'concrete'
         ? spec.gripAsphalt : spec.gripGrass;
-      const mu = gripBase * mat.mu * 1.0;
+      // a bent rim or a flat tyre gives up part of the grip
+      const mu = gripBase * mat.mu * (1 - 0.4 * rim);
       const Fz = springF;
       const maxF = mu * Fz;
       w.maxF = maxF;
@@ -481,7 +513,7 @@ export class Vehicle {
       // longitudinal request
       const axleShare = w.front ? 0.4 : 0.6;
       let flong = drive * axleShare * 0.5;
-      const brakeF = (w.front ? spec.brakeBias : 1 - spec.brakeBias) * brakeTotal * 0.5;
+      const brakeF = (w.front ? spec.brakeBias : 1 - spec.brakeBias) * brakeTotal * 0.5 * (1 - 0.7 * rim);
       const hb = (!w.front ? this.handbrake * spec.brakeForce * 0.5 : 0);
       const braking = brakeF + hb;
       if (braking > 0) {
@@ -578,7 +610,9 @@ export class Vehicle {
       tex[o] = pos[i * 3] - rest[i * 3];
       tex[o + 1] = pos[i * 3 + 1] - rest[i * 3 + 1];
       tex[o + 2] = pos[i * 3 + 2] - rest[i * 3 + 2];
-      tex[o + 3] = 1;
+      // unused .w of the position row: damage of this node, drives the crumpled
+      // paint, the cracked glass and the shot-out lights in the shader
+      tex[o + 3] = this.body.nodeDamage[i];
 
       // least squares rotation of this node's neighbourhood (Horn, warm started)
       const px = pos[i * 3], py = pos[i * 3 + 1], pz = pos[i * 3 + 2];
@@ -625,7 +659,8 @@ export class Vehicle {
       tex[o + 12] = 2 * (cx * cz + cy * cw);      // col2.x
       tex[o + 13] = 2 * (cy * cz - cx * cw);      // col2.y
       tex[o + 14] = 1 - 2 * (cx * cx + cy * cy);  // col2.z
-      tex[o + 15] = 0;
+      // unused .w of the last rotation row: how badly this node is folded
+      tex[o + 15] = this.body.nodeCrumple[i];
     }
   }
 
@@ -636,63 +671,262 @@ export class Vehicle {
     return sum / b.nb;
   }
 
+  /**
+   * Bucket every beam into the six panels the HUD draws and into the set of
+   * beams that make up the passenger safety cell.  Done once, in car space.
+   */
+  buildBeamZones() {
+    const b = this.body;
+    const local = this.cage.pos;
+    for (let i = 0; i < b.nb; i++) {
+      const a = b.ba[i], c = b.bb[i];
+      const mz = (local[a * 3 + 2] + local[c * 3 + 2]) * 0.5;
+      const mx = (local[a * 3] + local[c * 3]) * 0.5;
+      const my = (local[a * 3 + 1] + local[c * 3 + 1]) * 0.5;
+      const row = mz > 1.02 ? 0 : (mz < -1.05 ? 4 : 2);
+      const side = mx > 0 ? 0 : 1;               // +x is the left side
+      this.zoneBeams[row + side].push(i);
+      if (my > 0.98 || (mz > -1.05 && mz < 0.85)) this.cabinBeams.push(i);
+    }
+  }
+
+  /**
+   * How badly a panel is hurt: the mean damage of the worst quarter of its
+   * beams.  A plain average over a whole panel is useless for reading damage --
+   * a collision folds a handful of beams completely while the rest of the panel
+   * stays untouched, and the average then says "3% damaged" about a destroyed
+   * nose.
+   */
+  beamDamage(list) {
+    const bd = this.body.bdamage;
+    const n = list.length;
+    if (!n) return 0;
+    const k = Math.max(1, Math.round(n * 0.25));
+    const scratch = this._damageScratch || (this._damageScratch = new Float64Array(4096));
+    const buf = k <= scratch.length ? scratch : new Float64Array(k);
+    buf.fill(-1, 0, k);
+    let sum = 0;
+    for (let i = 0; i < n; i++) {
+      const d = bd[list[i]];
+      sum += d;
+      // keep the k largest values in a small insertion buffer
+      if (d <= buf[k - 1]) continue;
+      let j = k - 1;
+      while (j > 0 && buf[j - 1] < d) { buf[j] = buf[j - 1]; j--; }
+      buf[j] = d;
+    }
+    let top = 0;
+    for (let i = 0; i < k; i++) top += buf[i] > 0 ? buf[i] : 0;
+    return clamp(top / k * 0.8 + (sum / n) * 0.2, 0, 1);
+  }
+
+  /** four stiff cage nodes next to a wheel hub: the reference frame used to
+      measure how far the wheel has been pushed out of its arch */
+  wheelAnchor(w) {
+    if (w._anchorNodes) return;
+    const hub = this.nearestNodeIndex(w);
+    const local = this.cage.pos;
+    const hx = local[hub * 3], hy = local[hub * 3 + 1], hz = local[hub * 3 + 2];
+    const cabin = new Set();
+    for (const i of this.cabinBeams) { cabin.add(this.body.ba[i]); cabin.add(this.body.bb[i]); }
+    const cand = [];
+    for (const i of cabin) {
+      const dx = local[i * 3] - hx, dy = local[i * 3 + 1] - hy, dz = local[i * 3 + 2] - hz;
+      cand.push([dx * dx + dy * dy + dz * dz, i]);
+    }
+    cand.sort((a, b) => a[0] - b[0]);
+    const nodes = cand.slice(0, 5).map((e) => e[1]);
+    let ax = 0, ay = 0, az = 0;
+    for (const i of nodes) {
+      ax += this.restWorld[i * 3]; ay += this.restWorld[i * 3 + 1]; az += this.restWorld[i * 3 + 2];
+    }
+    const n = nodes.length || 1;
+    w._anchorNodes = nodes;
+    w._anchorRest = [ax / n, ay / n, az / n];
+  }
+
+  /** damage bookkeeping: panels, safety cell, wheels, drivetrain, lights */
   updateDamage(dt) {
+    const b = this.body;
     const prev = this.damage;
-    this.damage = this.damageRatio();
-    if (this.damage > prev + 0.0015) this.impactFlash = 1;
-    const impact = this.body.maxImpact;
+    const impact = b.maxImpact;
     if (impact > this.lastImpact * 1.5 && impact > 40) this.lastImpact = impact;
     this.lastImpact *= 0.995;
 
-    // wheel loss when the surrounding structure is destroyed
+    // ---- panels for the HUD silhouette
+    let zmax = 0, zsum = 0;
+    for (let z = 0; z < 6; z++) {
+      const d = this.beamDamage(this.zoneBeams[z]);
+      this.damageZones[z] = d;
+      zmax = Math.max(zmax, d);
+      zsum += d;
+    }
+    // shell damage: the worst panel counts most, so a destroyed nose reads as a
+    // wrecked car even while the rest of the shell is still straight
+    this.shellDamage = clamp(zmax * 0.45 + (zsum / 6) * 0.55, 0, 1);
+    this.cabinIntegrity = 1 - clamp(this.beamDamage(this.cabinBeams) * 1.35, 0, 1);
+
+    // ---- drivetrain / steering consequences
+    const frontL = this.damageZones[0], frontR = this.damageZones[1];
+    const front = (frontL + frontR) * 0.5;
+    this.engineDamage = Math.max(this.engineDamage * (1 - dt * 0.02), clamp((front - 0.16) * 2.1, 0, 1));
+    this.powerScale = clamp(1 - this.engineDamage * 0.92, 0.08, 1);
+    this.steeringDamage = clamp((Math.max(frontL, frontR) - 0.1) * 1.5, 0, 1);
+    // a bent corner drags the car towards the damaged side
+    this.steerPull = (frontL - frontR) * 0.22;
+    this.lightsOut = clamp((frontL + frontR) * 1.4, 0, 0.92);
+
+    // ---- wheels: rim damage from the local cage frame (a crushed nose must
+    // not count as a bent rear wheel), plus torn strut towers
+    const R = this.R;
+    const cx = this.center[0], cy = this.center[1], cz = this.center[2];
+    const rc = this.restCentroid;
     for (const w of this.wheels) {
-      if (w.detached) continue;
+      if (w.detached) { w.rimDamage = 1; continue; }
       const hub = this.nearestNodeIndex(w);
+      this.wheelAnchor(w);
+      const nodes = w._anchorNodes;
+      let ax = 0, ay = 0, az = 0;
+      for (const i of nodes) {
+        ax += b.pos[i * 3]; ay += b.pos[i * 3 + 1]; az += b.pos[i * 3 + 2];
+      }
+      const n = nodes.length || 1;
+      ax /= n; ay /= n; az /= n;
+      const ar = w._anchorRest;
+      // rigid prediction of the anchor, then correct with what it actually did
+      const rax = cx + R[0] * (ar[0] - rc[0]) + R[1] * (ar[1] - rc[1]) + R[2] * (ar[2] - rc[2]);
+      const ray = cy + R[3] * (ar[0] - rc[0]) + R[4] * (ar[1] - rc[1]) + R[5] * (ar[2] - rc[2]);
+      const raz = cz + R[6] * (ar[0] - rc[0]) + R[7] * (ar[1] - rc[1]) + R[8] * (ar[2] - rc[2]);
+      const corr = [ax - rax, ay - ray, az - raz];
+      const hx = this.restWorld[hub * 3], hy = this.restWorld[hub * 3 + 1], hz = this.restWorld[hub * 3 + 2];
+      const ex = cx + R[0] * (hx - rc[0]) + R[1] * (hy - rc[1]) + R[2] * (hz - rc[2]) + corr[0];
+      const ey = cy + R[3] * (hx - rc[0]) + R[4] * (hy - rc[1]) + R[5] * (hz - rc[2]) + corr[1];
+      const ez = cz + R[6] * (hx - rc[0]) + R[7] * (hy - rc[1]) + R[8] * (hz - rc[2]) + corr[2];
+      const disp = Math.hypot(b.pos[hub * 3] - ex, b.pos[hub * 3 + 1] - ey, b.pos[hub * 3 + 2] - ez);
+
       if (w._hubBeams === undefined) {
         w._hubBeams = [];
-        for (let b = 0; b < this.body.nb; b++) {
-          if (this.body.ba[b] === hub || this.body.bb[b] === hub) w._hubBeams.push(b);
+        for (let bi = 0; bi < b.nb; bi++) {
+          if (b.ba[bi] === hub || b.bb[bi] === hub) w._hubBeams.push(bi);
         }
       }
-      let broken = 0;
-      for (const b of w._hubBeams) if (this.body.bbroken[b]) broken++;
-      const frac = w._hubBeams.length ? broken / w._hubBeams.length : 0;
-      // Displacement must be measured in the *body frame*: restWorld is the
-      // spawn pose, so comparing raw world positions made every wheel "fall
-      // off" as soon as the car simply drove a metre away from the spawn.
-      // Undo the rigid fit (center + R) first, then compare with the rest pose.
-      const R = this.R;
-      const cx = this.center[0], cy = this.center[1], cz = this.center[2];
-      const px = this.body.pos[hub * 3] - cx;
-      const py = this.body.pos[hub * 3 + 1] - cy;
-      const pz = this.body.pos[hub * 3 + 2] - cz;
-      const lx = R[0] * px + R[3] * py + R[6] * pz + this.restCentroid[0];
-      const ly = R[1] * px + R[4] * py + R[7] * pz + this.restCentroid[1];
-      const lz = R[2] * px + R[5] * py + R[8] * pz + this.restCentroid[2];
-      const disp = Math.hypot(
-        lx - this.restWorld[hub * 3],
-        ly - this.restWorld[hub * 3 + 1],
-        lz - this.restWorld[hub * 3 + 2],
-      );
-      w.rimDamage = Math.max(frac, clamp((disp - 0.28) * 2.2, 0, 1));
-      if (frac > 0.62 || disp > 0.75) {
-        w.pendingDetach = true;
+      let torn = 0;
+      for (const bi of w._hubBeams) if (b.bbroken[bi]) torn++;
+      const frac = w._hubBeams.length ? torn / w._hubBeams.length : 0;
+
+      // 26 cm of relative hub movement = the wheel has been pushed out of its
+      // arch; suspension compliance alone is a few centimetres
+      const rim = Math.max(frac * 1.1, clamp((disp - 0.26) * 2.4, 0, 1));
+      w.rimDamage = Math.max((w.rimDamage || 0) * 0.999, clamp(rim, 0, 1));
+      w.hubDisp = disp;
+      // a wheel comes off when the arch around it is destroyed: pushed out of
+      // place, or with most of its hub beams torn
+      if (frac > 0.50 || (disp > 0.42 && rim > 0.8)) {
+        // tear it off right here: the physics has to be self-contained, the
+        // render loop only *reads* the result (and spawns the dust)
+        const prop = this.detachWheel(w);
+        if (prop) this.detachedProps.push(prop);
       }
     }
     this.wheelDamage = this.wheels.reduce((s, w) => s + (w.rimDamage || 0), 0) / this.wheels.length;
+    this.detachedCount = this.wheels.filter((w) => w.detached).length;
+
+    // headline severity for the player: shell + lost wheels + a broken safety
+    // cell.  A car that has lost both front wheels is "badly damaged" even when
+    // the paint on the doors is still perfect.
+    const lostWheels = this.detachedCount;
+    this.damage = clamp(
+      this.shellDamage * 0.85
+      + lostWheels * 0.10
+      + (1 - this.cabinIntegrity) * 1.20
+      + this.wheelDamage * 0.10,
+      0, 1);
+    this.structural = 1 - this.shellDamage;
+    if (this.damage > prev + 0.002 && this.impactFlash < 0.35) this.impactFlash = 0.35;
+
+    this.impactTimer = Math.max(0, (this.impactTimer || 0) - dt);
   }
 
-  /** collect wheels that should become free bodies this frame */
+  /** pull the impact events out of the solver right after a substep */
+  drainImpacts() {
+    const b = this.body;
+    if (b.contactEvent) {
+      const e = b.contactEvent;
+      this.impacts.push({
+        x: e.x, y: e.y, z: e.z, power: e.power, normal: e.normal,
+        hard: !!e.hard, tear: false, speed: e.power * 22,
+      });
+      if (e.power > 0.35) {
+        this.lastImpactSpeed = e.power * 22 * 3.6;
+        this.impactTimer = 1.4;
+      }
+      b.contactEvent = null;
+    }
+    for (const ev of b.events) {
+      this.impacts.push({ x: ev.x, y: ev.y, z: ev.z, power: ev.power * 0.8, tear: true, speed: 0 });
+    }
+    if (b.events.length) b.events.length = 0;
+    if (this.impacts.length > 64) this.impacts.splice(0, this.impacts.length - 64);
+  }
+
+  /** wheels torn off since the last call (for dust / debris effects) */
   takeDetachedWheels() {
-    const out = [];
+    const out = this.detachedProps;
+    this.detachedProps = [];
+    return out;
+  }
+
+  /**
+   * A wheel that came off keeps existing: it flies, bounces, rolls and finally
+   * comes to rest instead of just vanishing.  Cheap rigid body -- a sphere for
+   * the tyre plus rolling friction -- but it is the difference between "my
+   * wheel fell off" and "my wheel was deleted".
+   */
+  updateDetachedWheels(dt) {
+    const R = CAR.wheelRadius;
     for (const w of this.wheels) {
-      if (w.pendingDetach && !w.detached) {
-        w.pendingDetach = false;
-        const p = this.detachWheel(w);
-        if (p) out.push(p);
+      if (!w.detached || !w.vel) continue;
+      w.vel[1] -= 9.81 * dt;
+      w.pos[0] += w.vel[0] * dt;
+      w.pos[1] += w.vel[1] * dt;
+      w.pos[2] += w.vel[2] * dt;
+      const ground = this.world.heightAt(w.pos[0], w.pos[2]) + R * 0.92;
+      let onGround = false;
+      if (w.pos[1] < ground) {
+        w.pos[1] = ground;
+        onGround = true;
+        if (w.vel[1] < 0) w.vel[1] = -w.vel[1] * 0.32;
+        if (w.vel[1] < 0.6) w.vel[1] = 0;
+        // rolling + a bit of sideways scrub
+        const f = Math.max(0, 1 - 2.6 * dt);
+        w.vel[0] *= f; w.vel[2] *= f;
+        if (Math.hypot(w.vel[0], w.vel[2]) < 0.25) { w.vel[0] = 0; w.vel[2] = 0; }
+      }
+      // tumble: integrate the quaternion, and let it settle flat on the ground
+      const spinSpeed = Math.hypot(w.vel[0], w.vel[2]);
+      w.spin += (w.spinRate || 0) * dt;
+      const av = w.angVel;
+      if (av) {
+        const damp = onGround ? Math.max(0, 1 - 3.4 * dt) : 1;
+        av[0] *= damp; av[1] *= damp; av[2] *= damp;
+        const [ax, ay, az] = av;
+        const [qx, qy, qz, qw] = w.quat;
+        const h = dt * 0.5;
+        const nx = qx + h * (ax * qw + ay * qz - az * qy);
+        const ny = qy + h * (ay * qw + az * qx - ax * qz);
+        const nz = qz + h * (az * qw + ax * qy - ay * qx);
+        const nw = qw + h * (-ax * qx - ay * qy - az * qz);
+        const l = Math.hypot(nx, ny, nz, nw) || 1;
+        w.quat[0] = nx / l; w.quat[1] = ny / l; w.quat[2] = nz / l; w.quat[3] = nw / l;
+      }
+      if (onGround && spinSpeed < 0.4 && av) {
+        // stand the wheel up: rotate the quaternion towards "axle horizontal"
+        const target = [0, 0, 0, 1];
+        for (let i = 0; i < 4; i++) w.quat[i] += (target[i] - w.quat[i]) * Math.min(1, dt * 1.6);
+        const l = Math.hypot(w.quat[0], w.quat[1], w.quat[2], w.quat[3]) || 1;
+        for (let i = 0; i < 4; i++) w.quat[i] /= l;
       }
     }
-    return out;
   }
 
   nearestNodeIndex(w) {
@@ -715,14 +949,25 @@ export class Vehicle {
   detachWheel(w) {
     if (w.detached) return null;
     w.detached = true;
+    w.rimDamage = 1;
     this.body.velNear(w.pos[0], w.pos[1], w.pos[2], _tmp);
+    // a torn-off wheel leaves with the car's momentum plus whatever the impact
+    // gave it; keep it alive so it can fly, bounce and roll away
+    w.vel = [_tmp[0], Math.max(_tmp[1], 0.4) + 1.1, _tmp[2]];
+    w.angVel = [
+      (Math.random() - 0.5) * 9,
+      (Math.random() - 0.5) * 9,
+      (Math.random() - 0.5) * 9,
+    ];
+    w.quat = [0, 0, 0, 1];
+    w.flat = 1;
     return {
       kind: 'wheel',
       radius: CAR.wheelRadius,
       half: [0.13, CAR.wheelRadius, CAR.wheelRadius],
       pos: [w.pos[0], w.pos[1], w.pos[2]],
-      vel: [_tmp[0], _tmp[1], _tmp[2]],
-      angVel: [w.spinRate * 0.6, 0.5, 0],
+      vel: w.vel.slice(),
+      angVel: w.angVel.slice(),
       mass: this.spec.wheelMass,
       spin: w.spin,
       quat: [0, 0, 0, 1],
@@ -730,13 +975,29 @@ export class Vehicle {
   }
 
   reset() {
-    const cosY = Math.cos(this.spawnYaw), sinY = Math.sin(this.spawnYaw);
     this.body.resetTo(this.restWorld, null);
     for (const w of this.wheels) {
       w.steer = 0; w.spin = 0; w.spinRate = 0; w.compression = 0;
-      w.detached = false; w.load = 0;
+      w.detached = false; w.load = 0; w.pendingDetach = false;
+      w.rimDamage = 0; w.flat = 0; w.hubDisp = 0;
+      w.quat = [0, 0, 0, 1]; w.angVel = null; w.vel = null;
     }
     this.damage = 0;
+    this.structural = 1;
+    this.cabinIntegrity = 1;
+    this.damageZones.fill(0);
+    this.engineDamage = 0;
+    this.steeringDamage = 0;
+    this.steerPull = 0;
+    this.powerScale = 1;
+    this.lightsOut = 0;
+    this.lastImpactSpeed = 0;
+    this.impactTimer = 0;
+    this.impactFlash = 0;
+    this.impacts.length = 0;
+    this.detachedProps.length = 0;
+    this.wheelDamage = 0;
+    this.detachedCount = 0;
     this.rotQuat[0] = 1; this.rotQuat[1] = 0; this.rotQuat[2] = 0; this.rotQuat[3] = 0;
     this.center[0] = this.spawnPos[0];
     this.center[1] = this.spawnPos[1];

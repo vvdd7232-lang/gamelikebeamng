@@ -5,6 +5,17 @@ import { CAR } from './cage.js';
 
 const MAX_JOINTS = 4;
 
+// surface kinds, kept in sync with MESH_FS
+const KIND_PAINT = 0;
+const KIND_LIGHT = 1;
+const KIND_GLASS = 2;
+const KIND_CARPAINT = 3;
+// The greenhouse is the 'glass' material.  'glass.front' is a glossy layer the
+// modeller laid over the windscreen *and* down the body sides, so it is only
+// treated as glass above the belt line -- below that it is body trim.
+const GLASS_MATERIALS = new Set(['glass', 'glass.dark']);
+const GLASS_ABOVE_Y = 0.92;
+
 /** nearest cage nodes for a local-space point (k nearest) */
 function nearestWeights(nodes, x, y, z, k) {
   const best = [];
@@ -37,6 +48,25 @@ export function buildCarGeometry(glb, cageNodes) {
   const wheels = [];
   const wheelGeom = [];
 
+  // The model ships a few glossy "glass" materials that also cover body panels.
+  // A triangle is a window only if *all* of it sits above the belt line; mixing
+  // kinds per vertex tears the surface into a speckled mess.
+  const triKinds = (prim, mat) => {
+    const pos = prim.positions;
+    const idx = prim.indices;
+    const np = pos.length / 3;
+    const isGlassMat = GLASS_MATERIALS.has(mat.name) || mat.name === 'glass.front';
+    if (!isGlassMat || !idx) return null;
+    const out = new Uint8Array(np);
+    const belt = mat.name === 'glass.front' ? GLASS_ABOVE_Y : 0.9;
+    for (let t = 0; t + 2 < idx.length; t += 3) {
+      const a = idx[t], b = idx[t + 1], c = idx[t + 2];
+      const above = pos[a * 3 + 1] > belt && pos[b * 3 + 1] > belt && pos[c * 3 + 1] > belt;
+      if (above) { out[a] = 1; out[b] = 1; out[c] = 1; }
+    }
+    return out;
+  };
+
   for (const node of glb.nodes) {
     const isBody = node.name === 'Body';
     for (const prim of node.primitives) {
@@ -46,6 +76,7 @@ export function buildCarGeometry(glb, cageNodes) {
       const mat = prim.material || { color: [0.5, 0.5, 0.5], metallic: 0.2, roughness: 0.6, emissive: [0, 0, 0], alpha: 1 };
       const np = pos.length / 3;
       const out = new Float32Array(np * STRIDE);
+      const glassVert = isBody ? triKinds(prim, mat) : null;
       for (let v = 0; v < np; v++) {
         const x = pos[v * 3], y = pos[v * 3 + 1], z = pos[v * 3 + 2];
         const o = v * STRIDE;
@@ -55,10 +86,16 @@ export function buildCarGeometry(glb, cageNodes) {
         let cr = mat.color[0], cg = mat.color[1], cb = mat.color[2];
         if (isBody && mat.name === 'Tesla') { cr = 0.62; cg = 0.07; cb = 0.07; }
         out[o + 6] = cr; out[o + 7] = cg; out[o + 8] = cb;
-        const emis = (mat.emissive[0] + mat.emissive[1] + mat.emissive[2]) > 0.01 ? 1.0 : 0.0;
         out[o + 9] = mat.metallic;
         out[o + 10] = mat.roughness;
-        out[o + 11] = emis;
+        // aMat.z: what the shader is looking at (must match MESH_FS)
+        const emis = (mat.emissive[0] + mat.emissive[1] + mat.emissive[2]) > 0.01;
+        const glass = glassVert ? glassVert[v] === 1
+          : (GLASS_MATERIALS.has(mat.name) || (mat.name === 'glass.front' && y > GLASS_ABOVE_Y));
+        out[o + 11] = emis ? KIND_LIGHT
+          : glass ? KIND_GLASS
+          : (isBody && mat.name === 'Tesla') ? KIND_CARPAINT
+          : KIND_PAINT;
         if (isBody) {
           const sw = nearestWeights(cageNodes, x, y, z, MAX_JOINTS);
           for (let j = 0; j < MAX_JOINTS; j++) {

@@ -23,29 +23,56 @@ export class SoftBody {
     this.ba = new Int32Array(this.nb);
     this.bb = new Int32Array(this.nb);
     this.brest = new Float64Array(this.nb);
+    this.brest0 = new Float64Array(this.nb);   // pristine rest length
     this.bk = new Float64Array(this.nb);
     this.bk0 = new Float64Array(this.nb);
     this.bdmg = new Float64Array(this.nb);
     this.bdamp = new Float64Array(this.nb);
     this.bdamp0 = new Float64Array(this.nb);
-    this.byield = new Float64Array(this.nb);
+    this.byield = new Float64Array(this.nb);   // tension
+    this.byieldC = new Float64Array(this.nb);  // compression (folds earlier)
     this.bbreak = new Float64Array(this.nb);
+    this.bbreakC = new Float64Array(this.nb);
     this.bbreakF = new Float64Array(this.nb);
+    this.bbreakFC = new Float64Array(this.nb);
+    this.bplastic = new Float64Array(this.nb);
+    this.bloss = new Float64Array(this.nb);
+    // how far a beam may be permanently crushed / stretched before the folded
+    // metal jams up; without this limit the front clip keeps flowing backwards
+    // until it is inside the cabin
+    this.bsetMaxC = new Float64Array(this.nb);
+    this.bsetMaxT = new Float64Array(this.nb);
+    this.bjammed = new Uint8Array(this.nb);
+    this.bkc = new Float64Array(this.nb);   // stiffness multiplier in compression
     this.bstrain = new Float64Array(this.nb);
-    this.bbroken = new Uint8Array(this.nb);
+    this.bbroken = new Uint8Array(this.nb);    // torn: still hangs by a strip
     this.bdamage = new Float64Array(this.nb);
     beams.forEach((b, i) => {
       this.ba[i] = b.a;
       this.bb[i] = b.b;
       this.brest[i] = b.rest;
+      this.brest0[i] = b.rest;
       this.bk[i] = b.k;
       this.bk0[i] = b.k;
       this.bdamp[i] = b.damp;
       this.bdamp0[i] = b.damp;
       this.byield[i] = b.yieldStrain;
+      this.byieldC[i] = b.yieldStrainC !== undefined ? b.yieldStrainC : b.yieldStrain * 0.8;
       this.bbreak[i] = b.breakStrain;
+      this.bbreakC[i] = b.breakStrainC !== undefined ? b.breakStrainC : b.breakStrain;
       this.bbreakF[i] = b.breakForce;
+      this.bbreakFC[i] = b.breakForceC !== undefined ? b.breakForceC : b.breakForce * 1.1;
+      this.bplastic[i] = b.plasticRate !== undefined ? b.plasticRate : 1;
+      this.bloss[i] = b.damageLoss !== undefined ? b.damageLoss : 0.45;
+      this.bsetMaxC[i] = b.setMaxC !== undefined ? b.setMaxC : 0.55;
+      this.bsetMaxT[i] = b.setMaxT !== undefined ? b.setMaxT : 0.85;
+      this.bkc[i] = b.kCompress !== undefined ? b.kCompress : 1;
     });
+
+    // per-node damage + permanent-set, used by the renderer for the crumpled
+    // paint, the glass cracks and the dent pattern
+    this.nodeDamage = new Float32Array(n);
+    this.nodeCrumple = new Float32Array(n);
 
     this.brokenCount = 0;
     this.totalDamage = 0; // 0..1 (fraction of beams yielded/broken, weighted)
@@ -56,10 +83,15 @@ export class SoftBody {
     this.plasticRate = 2.6;    // permanent-set speed (1/s)
     this.plasticCap = 0.5;     // max strain absorbed per substep
     this.damageRate = 22;      // damage accumulation per unit overstrain
+    this.tetherStiffness = 0.02; // a torn beam keeps hanging by a thin strip
     this.airDrag = 0.0009;
     this.contactImpulse = 0;
     this.centerVelocity = [0, 0, 0];
     this.noGround = false;
+    // impact events produced during the last step (drained by the vehicle):
+    // { x, y, z, power } power in [0..1] relative to "sure to hurt"
+    this.events = [];
+    this.contactEvent = null;
   }
 
   resetTo(restPos, transform) {
@@ -79,10 +111,16 @@ export class SoftBody {
       this.bdmg[i] = 0;
       this.bk[i] = this.bk0[i];
       this.bdamp[i] = this.bdamp0[i];
+      this.brest[i] = this.brest0[i];
     }
+    this.nodeDamage.fill(0);
+    this.nodeCrumple.fill(0);
+    this.bjammed.fill(0);
     this.brokenCount = 0;
     this.totalDamage = 0;
     this.maxImpact = 0;
+    this.events.length = 0;
+    this.contactEvent = null;
   }
 
   addForce(i, fx, fy, fz) {
@@ -95,6 +133,9 @@ export class SoftBody {
   step(dt, world, colliders) {
     const { pos, vel, force, mass, invMass } = this;
     const n = this.n;
+    // events are per-substep; the vehicle drains them right after this call
+    if (this.events.length > 64) this.events.length = 64;
+    this.contactEvent = null;
 
     // ---- gravity + air drag
     for (let i = 0; i < n; i++) {
@@ -102,11 +143,13 @@ export class SoftBody {
     }
 
     // ---- beams
-    const { ba, bb, brest, bk, bdamp, byield, bbreak, bbreakF, bstrain, bbroken } = this;
+    const {
+      ba, bb, brest, bk, bdamp, byield, byieldC, bbreak, bbreakC, bbreakF, bbreakFC,
+      bstrain, bbroken, bplastic, bloss, brest0, bkc,
+    } = this;
     let brokenNow = 0;
     let damageSum = 0;
     for (let b = 0; b < this.nb; b++) {
-      if (bbroken[b]) continue;
       const a = ba[b] * 3, c = bb[b] * 3;
       let dx = pos[c] - pos[a];
       let dy = pos[c + 1] - pos[a + 1];
@@ -123,44 +166,96 @@ export class SoftBody {
       const k = bk[b];
       const elastic = k * (len - rest);      // >0 = stretched
 
-      const absStrain = Math.abs(strain);
-      // ---- plastic deformation: permanent set + damage (time scaled, no runaway)
-      if (absStrain > byield[b]) {
-        const over = absStrain - byield[b];
-        // plastic flow: the beam takes a permanent set proportional to how far
-        // past yield it is, but is capped so one frame cannot straighten it out
-        const flow = Math.min(over, this.plasticCap) * this.plasticRate * dt;
-        brest[b] += Math.sign(strain) * flow * rest;
-        this.bdmg[b] = Math.min(1, this.bdmg[b] + over * this.damageRate * dt);
-        bk[b] = this.bk0[b] * (1 - 0.72 * this.bdmg[b]);
-        damageSum += Math.min(1, over * 8);
-      }
-      // ---- breakage
-      if (absStrain > bbreak[b] || Math.abs(elastic) > bbreakF[b]) {
-        bbroken[b] = 1;
-        brokenNow++;
-        this.bdamage[b] = 1;
-        const imp = Math.abs(elastic) * Math.min(absStrain, 1.0);
-        if (imp > this.maxImpact) this.maxImpact = imp;
-        continue;
-      }
-      if (absStrain > byield[b]) {
-        const imp = Math.abs(elastic) * (absStrain - byield[b]);
-        if (imp > this.maxImpact) this.maxImpact = imp;
+      if (!bbroken[b]) {
+        const tension = strain > 0;
+        const yieldS = tension ? byield[b] : byieldC[b];
+        const absStrain = Math.abs(strain);
+        // ---- plastic deformation: permanent set + damage (time scaled, no runaway)
+        if (absStrain > yieldS) {
+          const over = absStrain - yieldS;
+          // plastic flow: the beam takes a permanent set proportional to how far
+          // past yield it is, but is capped so one frame cannot straighten it out.
+          // Crumple zones flow fast (they fold), the safety cage barely at all.
+          const flow = Math.min(over, this.plasticCap) * this.plasticRate * bplastic[b] * dt;
+          let nextRest = brest[b] + Math.sign(strain) * flow * rest;
+          // a folded beam bottoms out: past its crush limit the metal jams and
+          // the joint gets *stiffer* instead of collapsing further into the car
+          const setC = Math.max(0, (brest0[b] - nextRest) / brest0[b]);
+          const setT = Math.max(0, (nextRest - brest0[b]) / brest0[b]);
+          if (setC > this.bsetMaxC[b] || setT > this.bsetMaxT[b]) {
+            nextRest = strain > 0
+              ? brest0[b] * (1 + this.bsetMaxT[b])
+              : brest0[b] * (1 - this.bsetMaxC[b]);
+            this.bjammed[b] = 1;
+          }
+          brest[b] = nextRest;
+          const softens = tension ? 1 : 1.35;
+          // damage comes from two things: the strain rate that is doing the
+          // work, and the permanent set the beam has already taken (a beam that
+          // is 30% shorter is *damaged*, even if the hit was over in 50 ms)
+          const set = Math.abs(nextRest - brest0[b]) / brest0[b];
+          this.bdmg[b] = Math.min(1, Math.max(
+            this.bdmg[b] + over * this.damageRate * softens * dt,
+            set * 1.9,
+          ));
+          // per-beam damage is what the panels / HUD / shader read; it lags the
+          // peak so a beam that has been folded stays "damaged" for good
+          this.bdamage[b] = Math.max(this.bdamage[b], this.bdmg[b]);
+          bk[b] = this.bk0[b] * (1 - bloss[b] * this.bdmg[b]) * (1 + (this.bjammed[b] ? 0.8 : 0));
+          damageSum += Math.min(1, over * 8);
+        }
+        // ---- breakage: sheet metal tears; what is left of the joint still
+        // hangs on by a thin strip instead of vanishing (that is what used to
+        // turn the car into a cloud of unconnected vertices on a big hit)
+        const breakS = tension ? bbreak[b] : bbreakC[b];
+        const breakF = tension ? bbreakF[b] : bbreakFC[b];
+        if (absStrain > breakS || Math.abs(elastic) > breakF) {
+          bbroken[b] = 1;
+          brokenNow++;
+          this.bdamage[b] = 1;
+          this.bdmg[b] = 1;
+          const imp = Math.abs(elastic) * Math.min(absStrain, 1.0);
+          if (imp > this.maxImpact) this.maxImpact = imp;
+          if (this.events.length < 24) {
+            const mx = (pos[a] + pos[c]) * 0.5, my = (pos[a + 1] + pos[c + 1]) * 0.5, mz = (pos[a + 2] + pos[c + 2]) * 0.5;
+            this.events.push({ x: mx, y: my, z: mz, power: Math.min(1, absStrain * 1.6), tear: true });
+          }
+          // tether: slack at the current length, a fraction of the stiffness
+          brest[b] = len;
+          bk[b] = this.bk0[b] * this.tetherStiffness;
+          bdamp[b] = this.bdamp0[b] * 2.5;
+        } else if (absStrain > yieldS) {
+          const imp = Math.abs(elastic) * (absStrain - yieldS);
+          if (imp > this.maxImpact) this.maxImpact = imp;
+        }
       }
 
       // ---- implicit spring + damper along the beam axis.
       // Backward Euler on the pair's axial DOF: unconditionally stable, so the
       // cage can be stiff without exploding.  Applied as a velocity impulse.
+      // A buckled beam pushing back is much softer than a stretched one, which
+      // is what folds a crumple zone into an accordion.
+      const kNow = strain < 0 ? bk[b] * bkc[b] : bk[b];
       const ma = mass[ba[b]], mb = mass[bb[b]];
       const mEff = (ma * mb) / (ma + mb);
-      const alpha = (k * dt * dt) / mEff;
+      const alpha = (kNow * dt * dt) / mEff;
       const beta = (bdamp[b] * dt) / mEff;
-      const vNew = (relV - (k * dt * (len - rest)) / mEff) / (1 + beta + alpha);
+      const vNew = (relV - (kNow * dt * (len - rest)) / mEff) / (1 + beta + alpha);
       const j = (vNew - relV) * mEff;
       if (j !== 0) {
         vel[a] -= (dx * j) / ma; vel[a + 1] -= (dy * j) / ma; vel[a + 2] -= (dz * j) / ma;
         vel[c] += (dx * j) / mb; vel[c + 1] += (dy * j) / mb; vel[c + 2] += (dz * j) / mb;
+      }
+      // expose the local state of the shell to the renderer (crumpled paint,
+      // crease lines, cracked glass).  Both are "highest ever", like real damage.
+      const dmg = this.bdamage[b];
+      const crumple = Math.min(1, Math.abs(brest[b] - brest0[b]) / (brest0[b] * 0.30));
+      if (dmg > 0.01 || crumple > 0.01) {
+        const ia = ba[b], ic = bb[b];
+        if (dmg > this.nodeDamage[ia]) this.nodeDamage[ia] = dmg;
+        if (dmg > this.nodeDamage[ic]) this.nodeDamage[ic] = dmg;
+        if (crumple > this.nodeCrumple[ia]) this.nodeCrumple[ia] = crumple;
+        if (crumple > this.nodeCrumple[ic]) this.nodeCrumple[ic] = crumple;
       }
     }
     if (brokenNow) this.brokenCount += brokenNow;
@@ -179,6 +274,9 @@ export class SoftBody {
         const depth = h + r - y;
         pos[i3 + 1] += depth;
         const vn = vel[i3] * nrm[0] + vel[i3 + 1] * nrm[1] + vel[i3 + 2] * nrm[2];
+        if (vn < -3.5 && (!this.contactEvent || -vn > this.contactEvent.power)) {
+          this.contactEvent = { x, y: h, z, power: Math.min(1, -vn / 22), normal: [nrm[0], nrm[1], nrm[2]] };
+        }
         if (vn < 0) {
           const rest = 0.08;
           const jn = -(1 + rest) * vn;
@@ -213,6 +311,16 @@ export class SoftBody {
           pos[i3 + 1] += c.normal[1] * c.depth;
           pos[i3 + 2] += c.normal[2] * c.depth;
           const vn = vel[i3] * c.normal[0] + vel[i3 + 1] * c.normal[1] + vel[i3 + 2] * c.normal[2];
+          if (vn < -3.5 && (!this.contactEvent || -vn * 1.25 > this.contactEvent.power)) {
+            this.contactEvent = {
+              x: pos[i3] - c.normal[0] * c.depth,
+              y: pos[i3 + 1] - c.normal[1] * c.depth,
+              z: pos[i3 + 2] - c.normal[2] * c.depth,
+              power: Math.min(1, -vn / 22),
+              normal: [c.normal[0], c.normal[1], c.normal[2]],
+              hard: true,
+            };
+          }
           if (vn < 0) {
             const jn = -(1 + 0.05) * vn;
             vel[i3] += c.normal[0] * jn;

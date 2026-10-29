@@ -35,17 +35,72 @@ export const WHEEL_DEFS = [
   { name: 'RR', x: -CAR.halfTrackRear, z: CAR.axleRear, front: false, left: false },
 ];
 
+// Beam stiffness.  These used to be ~8x softer, which made the whole body fold
+// like a rag: a 100 km/h hit crushed the car from 4.7 m to 2.9 m because the
+// beams could not carry the deceleration into the rest of the structure.  Real
+// car structures are far stiffer than a 1.5 t car needs to sag 5 cm, and the
+// solver is implicit (unconditionally stable), so the stiffness is free.
 const BEAM = {
-  ringK: 2.6e5,
-  longK: 2.2e5,
-  diagK: 1.5e5,
-  ringDamp: 900,
-  longDamp: 800,
-  diagDamp: 600,
+  ringK: 2.1e6,
+  longK: 1.76e6,
+  diagK: 1.2e6,
+  ringDamp: 2600,
+  longDamp: 2300,
+  diagDamp: 1700,
   yieldStrain: 0.045,
   breakStrain: 0.26,
-  breakForce: 160000,
+  // scaled with the stiffness so a beam still tears at the same *strain*
+  breakForce: 1.28e6,
 };
+
+/**
+ * Crush zones.
+ *
+ * A real car is not a uniform steel shell: the front and rear ends are designed
+ * to fold up and eat the impact energy, while the passenger cell around the
+ * seats is a stiff safety cage that must keep its shape.  Giving every beam the
+ * same yield/break limits (what this used to do) meant a 100 km/h hit turned the
+ * whole car -- roof included -- into the same amorphous ball.
+ *
+ *  - `k`:           stiffness multiplier
+ *  - `yield`:       plastic yield strain multiplier (tension / compression)
+ *  - `break`:       strain at which the beam tears (tension / compression)
+ *  - `force`:       force at which the beam tears
+ *  - `plastic`:     how fast the permanent set accumulates (crumple zones fold,
+ *                   the cage mostly springs back)
+ *  - `damageLoss`:  how much stiffness a fully damaged beam keeps
+ */
+const ZONES = {
+  crumple: {
+    // yield sits above the strain gravity puts into the front overhang, so a
+    // parked car never slowly "yields"; the crush limits below still let a hit
+    // fold the clip right up
+    k: 0.5, yield: [1.45, 1.15], break: [3.20, 4.20], force: 80.0, plastic: 1.6, damageLoss: 0.6,
+    // the clip folds up like a concertina and stays attached to the car; it
+    // only tears off in a really violent hit
+    setC: 0.66, setT: 0.70,
+  },
+  cabin: {
+    k: 1.12, yield: [2.10, 1.70], break: [1.55, 1.30], force: 2.40, plastic: 0.45, damageLoss: 0.32,
+    setC: 0.20, setT: 0.40,
+  },
+  // longitudinal beams running from a crumple zone into the cage: they are
+  // the hinges the front end folds around, so they sit between the two
+  boundary: {
+    k: 0.75, yield: [1.0, 0.85], break: [1.35, 1.55], force: 1.30, plastic: 1.0, damageLoss: 0.42,
+    setC: 0.40, setT: 0.55,
+  },
+};
+
+/** which crush zone a beam midpoint belongs to */
+function zoneOf(z, y) {
+  // the roof rails over the passenger cell are always part of the cage
+  if (y > 0.98) return 'cabin';
+  if (z > 1.25) return 'crumple';
+  if (z < -1.45) return 'crumple';
+  if (z > 0.85 || z < -1.05) return 'boundary';
+  return 'cabin';
+}
 
 export function buildCage() {
   const rings = CAGE.rings;
@@ -89,13 +144,29 @@ export function buildCage() {
     seen.add(kk);
     // longer beams are softer, short ones stiff -> similar buckling behaviour
     const scale = Math.min(1.5, Math.max(0.5, 0.55 / Math.max(d, 0.1)));
+    const mz = (pos[a * 3 + 2] + pos[b * 3 + 2]) * 0.5;
+    const my = (pos[a * 3 + 1] + pos[b * 3 + 1]) * 0.5;
+    const zoneName = zoneOf(mz, my);
+    const zone = ZONES[zoneName];
     beams.push({
       a, b, rest: d,
-      k: k * scale, damp: damp * scale,
-      yieldStrain: BEAM.yieldStrain,
-      breakStrain: BEAM.breakStrain,
-      breakForce: BEAM.breakForce * Math.min(1.5, scale),
+      k: k * scale * zone.k, damp: damp * scale,
+      // tension / compression limits are different: sheet metal folds much
+      // sooner than it tears
+      yieldStrain: BEAM.yieldStrain * zone.yield[0],
+      yieldStrainC: BEAM.yieldStrain * zone.yield[1],
+      breakStrain: BEAM.breakStrain * zone.break[0],
+      breakStrainC: BEAM.breakStrain * zone.break[1],
+      breakForce: BEAM.breakForce * Math.min(1.5, scale) * zone.force,
+      breakForceC: BEAM.breakForce * Math.min(1.5, scale) * zone.force * 1.1,
+      plasticRate: zone.plastic,
+      damageLoss: zone.damageLoss,
+      setMaxC: zone.setC,
+      setMaxT: zone.setT,
+      zone: zoneName,
       len: d,
+      // joint of the cage, used to measure driver/passenger cell integrity
+      cabin: (mz > -1.05 && mz < 0.85) || my > 0.98,
     });
   };
 

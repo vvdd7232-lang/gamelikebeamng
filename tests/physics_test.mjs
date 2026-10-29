@@ -55,27 +55,43 @@ run(car, 2.5, { throttle: 0.35, brake: 0, steer: 1, handbrake: 0 });
 console.log('corner: speed', car.speed.toFixed(1), 'yawRate', car.yawRate.toFixed(2),
   'roll(up)', car.basis.y.map(v => v.toFixed(2)).join(','));
 
-// ---- crash into a wall at speed
-const car2 = makeCar();
-const wall = world.colliders[0];
+// ---- crash into the concrete barrier on the test pad at 100 km/h
+// (the pad has a 30 m run-up in front of the wall, so the cage is launched the
+// way the in-game crash test key does it)
+const car2 = new Vehicle(world, {
+  spawn: { position: [225, world.heightAt(225, 285), 285], yaw: 0 },
+});
 run(car2, 1.5, { throttle: 0, brake: 0, steer: 0, handbrake: 0 });
-// teleport-ish: drive towards the wall using a straight line by pointing the body
-car2.body.pos.forEach((_, i) => {});
-const tImpact = Date.now();
-// launch the car at the wall by setting velocities
-const dir = [wall.center[0] - car2.center[0], 0, wall.center[2] - car2.center[2]];
-const dl = Math.hypot(dir[0], dir[2]);
+const vCrash = 100 / 3.6;
 for (let i = 0; i < car2.nodeCount; i++) {
-  car2.body.vel[i * 3] = dir[0] / dl * 24;
-  car2.body.vel[i * 3 + 2] = dir[2] / dl * 24;
+  car2.body.vel[i * 3] = 0;
+  car2.body.vel[i * 3 + 1] = 0;
+  car2.body.vel[i * 3 + 2] = vCrash;   // +z is straight at the barrier
 }
+const tImpact = Date.now();
 let maxDmg = 0;
-run(car2, 2.0, { throttle: 0.5, brake: 0, steer: 0, handbrake: 0 }, 1 / 60, () => {
+run(car2, 2.5, { throttle: 0.5, brake: 0, steer: 0, handbrake: 0 }, 1 / 60, () => {
   maxDmg = Math.max(maxDmg, car2.damage);
 });
-console.log('crash: damage', car2.damage.toFixed(3), 'broken beams', car2.body.brokenCount,
-  'of', car2.body.nb, 'compute ms', Date.now() - tImpact);
-console.log('  wheels detached?', car2.takeDetachedWheels().length);
+const bodyLen = () => {
+  const R = car2.R, rc = car2.restCentroid, c = car2.center;
+  let mn = Infinity, mx = -Infinity;
+  for (let i = 0; i < car2.nodeCount; i++) {
+    const px = car2.body.pos[i * 3] - c[0];
+    const py = car2.body.pos[i * 3 + 1] - c[1];
+    const pz = car2.body.pos[i * 3 + 2] - c[2];
+    const lz = R[2] * px + R[5] * py + R[8] * pz + rc[2];
+    mn = Math.min(mn, lz); mx = Math.max(mx, lz);
+  }
+  return mx - mn;
+};
+console.log('crash 100 km/h: damage', car2.damage.toFixed(3), 'peak', maxDmg.toFixed(3),
+  'broken beams', car2.body.brokenCount, 'of', car2.body.nb, 'compute ms', Date.now() - tImpact);
+console.log('  body length', bodyLen().toFixed(2), 'm (was 4.72)',
+  'front panel damage', car2.damageZones[0].toFixed(2), '/', car2.damageZones[1].toFixed(2));
+console.log('  wheels detached?', car2.takeDetachedWheels().length,
+  'cabin', (car2.cabinIntegrity * 100).toFixed(0) + '%',
+  'power', (car2.powerScale * 100).toFixed(0) + '%');
 console.log('  car still has mass', car2.body.totalMass().toFixed(0));
 console.log('  up axis', car2.basis.y.map(v => v.toFixed(2)).join(','));
 

@@ -17,7 +17,10 @@ import sys
 import numpy as np
 from PIL import Image
 
-W, H = 960, 540          # render size (the capture happens at 1280x720)
+# render size (the capture happens at 1280x720); MIRROR_SCALE=0.66 halves the
+# pixel count, handy while iterating on the shaders
+_SCALE = float(os.environ.get('MIRROR_SCALE', '1'))
+W, H = int(960 * _SCALE), int(540 * _SCALE)
 
 
 # --------------------------------------------------------------------- helpers
@@ -140,6 +143,41 @@ def attribute(buf, attrib, size=None):
         block, shape=(n, size), strides=(stride * 4, 4), writeable=False)
 
 
+def _fhash(x, y, z):
+    v = np.sin(x * 127.1 + y * 311.7 + z * 74.7) * 43758.5453
+    return v - np.floor(v)
+
+
+def vnoise(p):
+    """3D value noise, the same construction as dNoise() in MESH_FS"""
+    i = np.floor(p)
+    f = p - i
+    f = f * f * (3.0 - 2.0 * f)
+    c = {}
+    for dx in (0, 1):
+        for dy in (0, 1):
+            for dz in (0, 1):
+                c[(dx, dy, dz)] = _fhash(i[:, 0] + dx, i[:, 1] + dy, i[:, 2] + dz)
+    x0 = c[(0, 0, 0)] * (1 - f[:, 0]) + c[(1, 0, 0)] * f[:, 0]
+    x1 = c[(0, 1, 0)] * (1 - f[:, 0]) + c[(1, 1, 0)] * f[:, 0]
+    x2 = c[(0, 0, 1)] * (1 - f[:, 0]) + c[(1, 0, 1)] * f[:, 0]
+    x3 = c[(0, 1, 1)] * (1 - f[:, 0]) + c[(1, 1, 1)] * f[:, 0]
+    y0 = x0 * (1 - f[:, 1]) + x1 * f[:, 1]
+    y1 = x2 * (1 - f[:, 1]) + x3 * f[:, 1]
+    return y0 * (1 - f[:, 2]) + y1 * f[:, 2]
+
+
+def vfbm(p, octaves=4):
+    v = np.zeros(len(p))
+    a = 0.5
+    q = p.copy()
+    for _ in range(octaves):
+        v += a * vnoise(q)
+        q = q * 2.03
+        a *= 0.5
+    return v
+
+
 def node_texels(node_tex, w, row, j):
     o = (row * w + j) * 4
     return node_tex[o:o + 3]
@@ -165,6 +203,8 @@ def shade_mesh(call, mesh_cache, node_tex, background, depth, color):
         bind_pos = u(call, 'uBindPos')
         w = node_tex['w']
         tex = node_tex['data']
+        damage = np.zeros(len(pos))
+        crumple = np.zeros(len(pos))
 
         # bind pose positions (world space at spawn)
         bind = pos @ bind_rot.T + bind_pos[None, :]
@@ -185,6 +225,9 @@ def shade_mesh(call, mesh_cache, node_tex, background, depth, color):
             # mat3(c0, c1, c2) in GLSL: the fetched texels are the *columns*
             D = np.stack([c0, c1, c2], axis=-1)         # (n, 3 rows, 3 cols)
             accD += D * wgt[:, :, None]
+            # spare .w channels: node damage (row 0) and crumple (row 3)
+            damage += wgt[:, 0] * tex[(0 * w + j) * 4 + 3]
+            crumple += wgt[:, 0] * tex[(3 * w + j) * 4 + 3]
         world_pos = acc
         # normal: (accD * uBindRot) * aNormal
         nmat = np.einsum('nij,jk->nik', accD, bind_rot)
@@ -192,6 +235,8 @@ def shade_mesh(call, mesh_cache, node_tex, background, depth, color):
     else:
         world_pos = pos @ model[:3, :3].T + model[:3, 3]
         world_nrm = nrm @ model[:3, :3].T
+        damage = np.zeros(len(pos))
+        crumple = np.zeros(len(pos))
 
     # project
     hom = np.concatenate([world_pos, np.ones((len(world_pos), 1))], axis=1)
@@ -222,12 +267,27 @@ def shade_mesh(call, mesh_cache, node_tex, background, depth, color):
     tri_ok &= (y.max(axis=1) > -50) & (y.min(axis=1) < H + 50)
     tri_ok &= (sz[idx] < 1.0).all(axis=1)
     tri = idx[tri_ok]
+    # shattered panes fall out (MESH_FS discards them): drop those triangles
+    if damage is not None and len(tri):
+        dmg_t = np.clip(damage[tri].mean(axis=1), 0, 1)
+        fold_t = np.clip(crumple[tri].mean(axis=1), 0, 1)
+        kind_t = np.rint(mat[tri].mean(axis=1)[:, 2]).astype(np.int32)
+        gain_t = np.clip(dmg_t * 0.75 + fold_t * 0.65, 0, 1)
+        centre = world_pos[tri].mean(axis=1)
+        hole_noise = vfbm(centre * 11.0 + 31.0)
+        holes = np.clip((gain_t - 0.40) / 0.15, 0, 1) * np.clip((hole_noise - 0.50) / 0.08, 0, 1)
+        keep = ~((kind_t == 2) & (holes > 0.5))
+        if not keep.all():
+            print(f'    {int((~keep).sum())} shattered glass triangles removed')
+            tri = tri[keep]
     print(f'    {len(tri)} / {len(idx)} triangles kept')
 
-    shade_pbr(call, tri, sx, sy, sz, world_pos, world_nrm, col, mat, background, depth, color)
+    shade_pbr(call, tri, sx, sy, sz, world_pos, world_nrm, col, mat, background, depth, color,
+              damage, crumple)
 
 
-def shade_pbr(call, tri, sx, sy, sz, wpos, wnrm, col, mat, background, depth, color):
+def shade_pbr(call, tri, sx, sy, sz, wpos, wnrm, col, mat, background, depth, color,
+              damage=None, crumple=None):
     cam = u(call, 'uCamPos')
     sun = u(call, 'uSunDir')
     sun_c = u(call, 'uSunColor')
@@ -249,10 +309,72 @@ def shade_pbr(call, tri, sx, sy, sz, wpos, wnrm, col, mat, background, depth, co
     vn = norm(wnrm[tri].mean(axis=1))
     flip = np.where((vn * fn).sum(axis=1) < 0, -1.0, 1.0)[:, None]
     vn = vn * flip
-    base = col[tri].mean(axis=1)
+    base = col[tri].mean(axis=1).copy()
     mm = mat[tri].mean(axis=1)
-    metal = np.clip(mm[:, 0], 0, 1)
-    rough = np.clip(mm[:, 1], 0.04, 1)
+    metal = np.clip(mm[:, 0], 0, 1).copy()
+    rough = np.clip(mm[:, 1], 0.04, 1).copy()
+    kind = np.rint(mat[tri].mean(axis=1)[:, 2]).astype(np.int32)
+    # windows are tinted glass (see MESH_FS)
+    gl = kind == 2
+    metal[gl] = 0.0
+    rough[gl] = 0.18
+    base = np.where(gl[:, None], base * 0.30, base)
+
+    # ---------------------------------------------------------------- damage
+    dmg = np.zeros(len(tri)) if damage is None else np.clip(damage[tri].mean(axis=1), 0, 1)
+    fold = np.zeros(len(tri)) if crumple is None else np.clip(crumple[tri].mean(axis=1), 0, 1)
+    tint = u(call, 'uTint', np.array([1.0, 1.0, 1.0]))
+    if np.ndim(tint) == 0:
+        tint = np.array([1.0, 1.0, 1.0])
+    base = np.where((kind == 3)[:, None], base * tint[None, :], base)
+    gain = np.clip(dmg * 0.75 + fold * 0.65, 0, 1)
+    emissive_scale = np.ones(len(tri))
+    ctr = p.mean(axis=1)
+    glass = kind == 2
+    lit = kind == 1
+    if (gain > 0.005).any():
+        gp = ctr * 7.0
+        n1 = vfbm(gp)
+        web = None
+        for scale, width in ((1.0, 0.055), (2.7, 0.035)):
+            n = vfbm(ctr * 7.0 * scale + 11.0) if scale > 1 else n1
+            line = 1.0 - np.clip(np.abs(n - 0.5) / width, 0, 1)
+            web = line if web is None else np.maximum(web, line * 0.8)
+        web *= np.clip((gain - 0.18) / 0.52, 0, 1)
+        # cracked glass: milky white with a spider web of bright fractures
+        gmask = glass[:, None]
+        milk = np.clip((gain - 0.35) * 0.45, 0, 0.30)
+        base = np.where(gmask, base * (1 - milk[:, None])
+                        + np.array([0.52, 0.57, 0.61])[None, :] * milk[:, None], base)
+        wv = (web * 0.55)[:, None]
+        base = np.where(gmask, base * (1 - wv) + np.array([0.80, 0.85, 0.88])[None, :] * wv, base)
+        # painted panels: chips to bare aluminium, lifted-paint lips, scratches
+        chip = vfbm(ctr * 14.0 + 3.0) * 0.72 + vfbm(ctr * 46.0) * 0.28
+        edge = 0.58 - gain * 0.22
+        chip_mask = np.clip((chip - edge) / 0.06, 0, 1) * np.clip(gain * 1.15, 0, 0.76)
+        lip = (np.clip((chip - (edge - 0.07)) / 0.07, 0, 1)
+               * (1 - np.clip((chip - edge) / 0.03, 0, 1)) * np.clip(gain, 0, 1))
+        bare = np.array([0.27, 0.285, 0.30])
+        pm = (~glass)[:, None]
+        base = np.where(pm, base * (1 - chip_mask[:, None]) + bare[None, :] * chip_mask[:, None], base)
+        base = np.where(pm, base * (1 - (lip * 0.55)[:, None]), base)
+        metal = np.where(pm[:, 0], metal * (1 - chip_mask) + 0.52 * chip_mask, metal)
+        rough = np.where(pm[:, 0], rough * (1 - chip_mask) + 0.62 * chip_mask, rough)
+        streak = vfbm(np.stack([ctr[:, 0] * 90.0, ctr[:, 1] * 3.0, ctr[:, 2] * 90.0], axis=1) + 7.0)
+        scratch = np.clip((streak - 0.62) / 0.08, 0, 1) * np.clip(gain * 1.2, 0, 0.85)
+        base = np.where(pm, base * (1 - (scratch * 0.6)[:, None])
+                        + np.array([0.42, 0.43, 0.44])[None, :] * (scratch * 0.6)[:, None], base)
+        rough = np.where(pm[:, 0], np.maximum(rough, 0.55 * scratch), rough)
+        soot = np.clip((vfbm(ctr * 3.1) * 0.55 + gain - 0.42) / 0.58, 0, 1)
+        base = np.where(pm, base * (1 - (soot * 0.75)[:, None] * 0.62), base)
+        rough = np.where(pm[:, 0], np.maximum(rough, 0.95 * soot * 0.6), rough)
+        if lit.any():
+            emissive_scale = np.ones(len(tri))
+            emissive_scale[lit] = 1.0 - 0.92 * np.clip(gain[lit] * 1.3, 0, 1)
+    # cracked glass scatters light: kill the sharp highlight where the web is
+    if glass.any() and (gain > 0.05).any():
+        rough = np.where(glass, np.maximum(rough, gain * 0.66), rough)
+
 
     centroid = p.mean(axis=1)
     V = norm(cam[None, :] - centroid)
@@ -262,6 +384,18 @@ def shade_pbr(call, tri, sx, sy, sz, wpos, wnrm, col, mat, background, depth, co
     tint = sky_c * 0.55 + ground_c * 0.2
     ambient = albedo * tint[None, :]
     direct = albedo * sun_c[None, :] * ndl[:, None] * 1.9
+    # crude environment reflection (skyRadiance in the shader): a bright sky
+    # above, the ground below, with a fresnel weight -- without it every
+    # surface looks like flat matte paint and glass reads as milk
+    upness = np.clip(N[:, 1] * 0.5 + 0.5, 0, 1)
+    env = (sky_c[None, :] * (0.35 + 0.45 * upness)[:, None]
+           + ground_c[None, :] * (0.55 - 0.45 * upness)[:, None] * 0.55)
+    ndv_env = np.clip((N * V).sum(axis=1), 1e-4, 1)
+    fres = (1.0 - ndv_env) ** 5
+    f0 = 0.045 * (1 - metal)[:, None] + base * metal[:, None]
+    eweight = np.clip(0.30 + 0.55 * (1 - rough) ** 2, 0, 1)
+    envspec = env * (f0 + fres[:, None] * (1 - rough)[:, None]) * eweight[:, None]
+    envspec[glass] *= 1.9
     spec = np.zeros_like(albedo)
     Hh = norm(sun[None, :] + V)
     ndh = np.clip((N * Hh).sum(axis=1), 0, 1)
@@ -274,7 +408,9 @@ def shade_pbr(call, tri, sx, sy, sz, wpos, wnrm, col, mat, background, depth, co
     F0 = 0.045 * (1 - metal)[:, None] + base * metal[:, None]
     F = F0 + (1 - F0) * (1 - np.clip((Hh * V).sum(axis=1), 0, 1))[:, None] ** 5
     spec = np.minimum(F * (D * G / (4 * ndv * np.maximum(ndl, 1e-4)))[:, None] * ndl[:, None], 24)
-    rgb = ambient + direct + spec * sun_c[None, :] + emissive[None, :]
+    if gl.any():
+        spec[gl] *= 0.55
+    rgb = ambient + direct + spec * sun_c[None, :] + envspec + emissive[None, :] * emissive_scale[:, None]
 
     # fog
     dist = np.linalg.norm(cam[None, :] - centroid, axis=1)
