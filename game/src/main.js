@@ -86,7 +86,7 @@ async function main() {
 
   camera.snap(player, world);
 
-  const clock = { last: performance.now(), acc: 0, frames: 0, fpsTime: 0, fps: 60 };
+  const clock = { last: performance.now(), acc: 0, frames: 0, fpsTime: 0, fps: 60, slow: 0, fast: 0 };
   let cageLines = null;
   const cageVerts = new Float32Array(20000 * 4);
 
@@ -136,6 +136,10 @@ async function main() {
   }
 
   function frame(now) {
+    if (renderer.width !== Math.round(renderer.canvas.clientWidth * renderer.dpr) ||
+        renderer.height !== Math.round(renderer.canvas.clientHeight * renderer.dpr)) {
+      renderer.fitToDisplay();
+    }
     const dtRaw = Math.min((now - clock.last) / 1000, 0.1);
     clock.last = now;
     clock.fpsTime += dtRaw;
@@ -143,6 +147,19 @@ async function main() {
     if (clock.fpsTime > 0.4) {
       clock.fps = clock.frames / clock.fpsTime;
       clock.frames = 0; clock.fpsTime = 0;
+      // adaptive resolution: software renderers and weak GPUs get a smaller
+      // drawing buffer (the canvas is stretched by CSS, so it still fills the
+      // window) instead of a slideshow
+      if (clock.fps < 32) { clock.slow++; clock.fast = 0; } else if (clock.fps > 56) { clock.fast++; clock.slow = 0; } else { clock.slow = 0; clock.fast = 0; }
+      if (clock.slow >= 3 && renderer.renderScale > 0.5) {
+        renderer.renderScale = Math.max(0.5, renderer.renderScale - 0.15);
+        renderer.resize(renderer.cssWidth, renderer.cssHeight);
+        clock.slow = 0;
+      } else if (clock.fast >= 8 && renderer.renderScale < 1) {
+        renderer.renderScale = Math.min(1, renderer.renderScale + 0.1);
+        renderer.resize(renderer.cssWidth, renderer.cssHeight);
+        clock.fast = 0;
+      }
     }
 
     const inp = input.update(dtRaw);
@@ -222,6 +239,15 @@ async function main() {
     input.endFrame();
     requestAnimationFrame(frame);
   }
+
+  // size the canvas to the window (the element has no width/height attributes,
+  // so without this the browser renders at 300x150 and CSS stretches it)
+  renderer.fitToDisplay();
+  const onResize = () => renderer.fitToDisplay();
+  window.addEventListener('resize', onResize);
+  if (window.visualViewport) window.visualViewport.addEventListener('resize', onResize);
+  // also catch the first layout pass after the loading overlay is removed
+  requestAnimationFrame(() => renderer.fitToDisplay());
 
   loading.classList.add('hidden');
   requestAnimationFrame(frame);

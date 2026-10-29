@@ -657,10 +657,22 @@ export class Vehicle {
       let broken = 0;
       for (const b of w._hubBeams) if (this.body.bbroken[b]) broken++;
       const frac = w._hubBeams.length ? broken / w._hubBeams.length : 0;
+      // Displacement must be measured in the *body frame*: restWorld is the
+      // spawn pose, so comparing raw world positions made every wheel "fall
+      // off" as soon as the car simply drove a metre away from the spawn.
+      // Undo the rigid fit (center + R) first, then compare with the rest pose.
+      const R = this.R;
+      const cx = this.center[0], cy = this.center[1], cz = this.center[2];
+      const px = this.body.pos[hub * 3] - cx;
+      const py = this.body.pos[hub * 3 + 1] - cy;
+      const pz = this.body.pos[hub * 3 + 2] - cz;
+      const lx = R[0] * px + R[3] * py + R[6] * pz + this.restCentroid[0];
+      const ly = R[1] * px + R[4] * py + R[7] * pz + this.restCentroid[1];
+      const lz = R[2] * px + R[5] * py + R[8] * pz + this.restCentroid[2];
       const disp = Math.hypot(
-        this.body.pos[hub * 3] - this.restWorld[hub * 3],
-        this.body.pos[hub * 3 + 1] - this.restWorld[hub * 3 + 1],
-        this.body.pos[hub * 3 + 2] - this.restWorld[hub * 3 + 2],
+        lx - this.restWorld[hub * 3],
+        ly - this.restWorld[hub * 3 + 1],
+        lz - this.restWorld[hub * 3 + 2],
       );
       w.rimDamage = Math.max(frac, clamp((disp - 0.28) * 2.2, 0, 1));
       if (frac > 0.62 || disp > 0.75) {

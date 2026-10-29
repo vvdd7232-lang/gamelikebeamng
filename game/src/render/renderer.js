@@ -52,6 +52,7 @@ export class Renderer {
     if (!this.gl) throw new Error('WebGL2 is not available in this browser.');
     const gl = this.gl;
     this.dpr = Math.min(window.devicePixelRatio || 1, 2);
+    this.renderScale = 1;      // reduced automatically on slow GPUs
     this.width = canvas.width;
     this.height = canvas.height;
 
@@ -116,11 +117,42 @@ export class Renderer {
     });
   }
 
-  resize(w, h) {
-    this.canvas.width = w;
-    this.canvas.height = h;
+  /**
+   * Size the drawing buffer for a CSS size and a device pixel ratio.  The
+   * canvas must get real width/height attributes: without them the browser
+   * keeps the 300x150 default and the CSS stretches that tiny image over the
+   * whole window, which is why everything looked like blurred blocks.
+   */
+  resize(cssWidth, cssHeight, dpr = window.devicePixelRatio || 1) {
+    // renderScale is lowered automatically when the GPU cannot keep up
+    const scale = Math.min(Math.max(dpr, 1), 2) * (this.renderScale || 1);
+    const w = Math.max(64, Math.round(cssWidth * scale));
+    const h = Math.max(64, Math.round(cssHeight * scale));
+    if (this.canvas.width !== w) this.canvas.width = w;
+    if (this.canvas.height !== h) this.canvas.height = h;
+    if (this.canvas.style) {
+      this.canvas.style.width = cssWidth + 'px';
+      this.canvas.style.height = cssHeight + 'px';
+    }
     this.width = w;
     this.height = h;
+    this.dpr = scale;
+    this.cssWidth = cssWidth;
+    this.cssHeight = cssHeight;
+    if (this.gl) this.gl.viewport(0, 0, w, h);
+  }
+
+  /** fit the canvas to its CSS box; returns true when the size changed */
+  fitToDisplay() {
+    const rect = this.canvas.getBoundingClientRect
+      ? this.canvas.getBoundingClientRect()
+      : { width: window.innerWidth, height: window.innerHeight };
+    const cssW = Math.max(1, Math.round(rect.width || window.innerWidth));
+    const cssH = Math.max(1, Math.round(rect.height || window.innerHeight));
+    const prevW = this.width;
+    const prevH = this.height;
+    this.resize(cssW, cssH);
+    return this.width !== prevW || this.height !== prevH;
   }
 
   // ------------------------------------------------------------------ world
@@ -404,8 +436,57 @@ export class Renderer {
 
   uploadNodeTexture(vehicle, inst) {
     const gl = this.gl;
+    // Bind on the node-texture unit explicitly.  Relying on the active unit was
+    // a real bug: the main pass leaves TEXTURE1 (the shadow map) active, so the
+    // node data was uploaded *into the shadow map* and the real node texture
+    // kept its zero initial content -- every skinned vertex then collapsed to a
+    // point and the car body was invisible.
+    gl.activeTexture(gl.TEXTURE0);
     gl.bindTexture(gl.TEXTURE_2D, this.nodeTex);
     gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, MAX_NODES, 5, gl.RGBA, gl.FLOAT, inst.nodeData);
+    if (this.nodeTexError === undefined) {
+      // one-shot sanity check that the GPUs accepts an RGBA32F float upload.
+      // Drain pending errors first so an unrelated earlier one is not blamed.
+      let guard = 0;
+      while (gl.getError() !== 0 && guard++ < 8) { /* drain */ }
+      gl.bindTexture(gl.TEXTURE_2D, this.nodeTex);
+      gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, MAX_NODES, 5, gl.RGBA, gl.FLOAT, inst.nodeData);
+      const err = gl.getError();
+      this.nodeTexError = err || 0;
+      if (err) {
+        console.warn('soft-body node texture upload rejected (0x' + err.toString(16) +
+          '), falling back to rigid body rendering');
+      }
+    }
+  }
+
+  /**
+   * Rigid placement of the car mesh for the current pose.
+   *
+   * M = T(center) * R * T(-restCentroid) * bindTransform, which is exactly what
+   * the skinned path produces when every node rotation equals the body
+   * rotation.  Used as a fallback when the float node texture is unusable, so a
+   * broken skinning path degrades to a rigid-but-visible car instead of none.
+   */
+  rigidBodyMatrix(vehicle, out) {
+    const R = vehicle.R;
+    const R0 = vehicle.R0;
+    const c = vehicle.center;
+    const rc = vehicle.restCentroid;
+    const p0 = vehicle.spawnPos;
+    const m = out || mat4.create();
+    for (let row = 0; row < 3; row++) {
+      for (let col = 0; col < 3; col++) {
+        let v = 0;
+        for (let k = 0; k < 3; k++) v += R[row * 3 + k] * R0[k * 3 + col];
+        m[col * 4 + row] = v;
+      }
+      let t = c[row] - rc[0] * R[row * 3] - rc[1] * R[row * 3 + 1] - rc[2] * R[row * 3 + 2];
+      for (let k = 0; k < 3; k++) t += R[row * 3 + k] * p0[k];
+      m[12 + row] = t;
+    }
+    m[3] = 0; m[7] = 0; m[11] = 0; m[15] = 1;
+    return m;
   }
 
   updateWheelMatrices(vehicle, inst) {
@@ -535,6 +616,7 @@ export class Renderer {
       for (const vehicle of vehicles) {
         const inst = this.vehicleInstances.get(vehicle);
         if (!inst) continue;
+        this.updateVehicleNodes(vehicle, inst);
         this.uploadNodeTexture(vehicle, inst);
         gl.activeTexture(gl.TEXTURE0);
         gl.bindTexture(gl.TEXTURE_2D, this.nodeTex);
@@ -604,7 +686,10 @@ export class Renderer {
 
     // cars
     if (this.carGeometry) {
-      gl.uniform1i(u.uSkinned, 1);
+      // if the node texture cannot be used on this GPU, fall back to drawing the
+      // car rigidly (it will not deform, but it will be visible)
+      const skinnable = !this.nodeTexError;
+      gl.uniform1i(u.uSkinned, skinnable ? 1 : 0);
       for (const vehicle of vehicles) {
         const inst = this.vehicleInstances.get(vehicle);
         if (!inst) continue;
@@ -614,7 +699,11 @@ export class Renderer {
         gl.activeTexture(gl.TEXTURE0);
         gl.bindTexture(gl.TEXTURE_2D, this.nodeTex);
         gl.uniform1i(u.uNodeTex, 0);
+        // the shadow map lives on unit 1 and must stay bound there
+        gl.activeTexture(gl.TEXTURE1);
+        gl.bindTexture(gl.TEXTURE_2D, this.shadowTex);
         gl.uniform1i(u.uNodeCount, vehicle.nodeCount);
+        if (!skinnable) gl.uniformMatrix4fv(u.uModel, false, this.rigidBodyMatrix(vehicle));
         gl.uniformMatrix3fv(u.uBindRot, false, inst.bindRot);
         gl.uniform3fv(u.uBindPos, inst.bindPos);
 
@@ -649,7 +738,7 @@ export class Renderer {
           }
         }
         gl.uniformMatrix4fv(u.uModel, false, this.model);
-        gl.uniform1i(u.uSkinned, 1);
+        gl.uniform1i(u.uSkinned, skinnable ? 1 : 0);
       }
       gl.uniform1i(u.uSkinned, 0);
     }

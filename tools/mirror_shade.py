@@ -359,6 +359,10 @@ def main(capture_dir, out_path):
     if node is None:
         node = {'data': np.zeros(320 * 5 * 4, dtype=np.float32), 'w': 320}
 
+    if os.environ.get('ZERO_NODES') == '1':
+        print('!! simulating a rejected node-texture upload (all texels zero)')
+        node = {'data': np.zeros_like(node['data']), 'w': node['w']}
+
     # sky first (it is the background)
     sky_call = next((c for c in frame['draws'] if 'uInvViewProj' in c['uniforms']), None)
     color = sky_image(sky_call) if sky_call else np.zeros((H, W, 3)) + 0.5

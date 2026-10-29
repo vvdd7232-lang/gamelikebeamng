@@ -202,12 +202,16 @@ camera.yaw = Number(process.env.CAM_YAW || 0.9);
 const effects = new Effects(world);
 
 const seconds = Number(process.env.DRIVE || 2.5);
+const idle = process.env.IDLE === '1';       // no throttle: reproduce a "parked" frame
 const steps = Math.round(seconds * 60);
 for (let i = 0; i < steps; i++) {
-  player.step(1 / 60, { throttle: 1, brake: 0, steer: i > steps * 0.7 ? 0.5 : 0, handbrake: 0 });
+  const throttle = idle ? 0 : 1;
+  player.step(1 / 60, { throttle, brake: 0, steer: i > steps * 0.7 ? 0.5 : 0, handbrake: 0 });
+  for (const d of player.takeDetachedWheels()) { void d; }
   effects.carEffects(player, 1 / 60, player.speed);
   effects.update(1 / 60);
 }
+if (process.env.DETACH === '1') { for (const w of player.wheels) player.detachWheel(w); }
 camera.snap(player, world);
 for (let i = 0; i < 30; i++) {
   camera.update(1 / 60, player, { mouse: { dx: 0, dy: 0, wheel: 0, dragging: false } }, world);
