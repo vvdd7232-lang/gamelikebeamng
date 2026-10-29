@@ -1,0 +1,16 @@
+{
+  "name": "softbody-drive",
+  "version": "1.0.0",
+  "description": "A BeamNG.drive-inspired soft-body car physics sandbox (WebGL2 + custom soft-body solver) built around the Tesla Model S model in this repo.",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node serve.js 8080",
+    "test": "node tests/physics_test.mjs && node tests/skinning_test.mjs && node tests/render_smoke.mjs",
+    "convert": "python3 tools/fbx2glb.py Tesla_Model_S_game.fbx game/assets/tesla.glb",
+    "cage": "python3 tools/gen_body_nodes.py",
+    "test:physics": "node tests/physics_test.mjs",
+    "test:skin": "node tests/skinning_test.mjs",
+    "test:render": "node tests/render_smoke.mjs"
+  },
+  "license": "MIT"
+}

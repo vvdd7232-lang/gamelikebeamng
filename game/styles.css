@@ -1,0 +1,237 @@
+:root {
+  --fg: #e9eef5;
+  --dim: #93a2b5;
+  --accent: #ff5a3c;
+  --panel: rgba(12, 16, 22, 0.62);
+  --edge: rgba(255, 255, 255, 0.10);
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+  overflow: hidden;
+  background: #0b0e13;
+  color: var(--fg);
+  font-family: 'Inter', 'Segoe UI', system-ui, -apple-system, sans-serif;
+  user-select: none;
+}
+
+#gl {
+  position: fixed;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  display: block;
+  cursor: grab;
+}
+#gl:active { cursor: grabbing; }
+
+#ui {
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+}
+
+/* ---------------------------------------------------------------- loading */
+#loading {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: radial-gradient(circle at 50% 40%, #16202c 0%, #080b10 70%);
+  z-index: 50;
+  transition: opacity 0.5s ease;
+}
+#loading.hidden { opacity: 0; pointer-events: none; }
+.loader-box { text-align: center; max-width: 520px; padding: 24px; }
+.loader-box h1 {
+  font-size: 40px;
+  letter-spacing: 6px;
+  margin: 0 0 18px;
+  font-weight: 800;
+}
+.loader-box h1 span, .brand span { color: var(--accent); }
+#loading-text {
+  color: var(--dim);
+  font-size: 14px;
+  min-height: 40px;
+  letter-spacing: 0.5px;
+}
+#loading-text pre { text-align: left; font-size: 11px; white-space: pre-wrap; }
+.bar {
+  margin: 18px auto 0;
+  width: 240px;
+  height: 3px;
+  background: rgba(255, 255, 255, 0.08);
+  overflow: hidden;
+  border-radius: 3px;
+}
+.bar i {
+  display: block;
+  height: 100%;
+  width: 40%;
+  background: var(--accent);
+  animation: slide 1.1s ease-in-out infinite;
+}
+@keyframes slide {
+  0% { transform: translateX(-100%); }
+  100% { transform: translateX(320%); }
+}
+.tiny { color: #5d6a7a; font-size: 11px; letter-spacing: 1px; margin-top: 22px; }
+
+/* ------------------------------------------------------------------ topbar */
+#topbar {
+  position: absolute;
+  top: 0; left: 0; right: 0;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 14px 20px;
+  font-size: 12px;
+  color: var(--dim);
+  letter-spacing: 0.6px;
+}
+.brand {
+  font-weight: 800;
+  letter-spacing: 3px;
+  color: #fff;
+  font-size: 14px;
+}
+.badges { display: flex; gap: 8px; align-items: center; }
+.badges .sep { opacity: 0.35; }
+#fps { color: #7ddc95; font-variant-numeric: tabular-nums; }
+.warn { color: var(--accent); font-weight: 600; }
+
+/* ------------------------------------------------------------------ toasts */
+#toast, #status, #slowmo {
+  position: absolute;
+  left: 50%;
+  transform: translateX(-50%);
+  background: var(--panel);
+  border: 1px solid var(--edge);
+  padding: 10px 18px;
+  border-radius: 999px;
+  font-size: 13px;
+  letter-spacing: 1px;
+  backdrop-filter: blur(6px);
+  transition: opacity 0.25s ease;
+}
+#toast { top: 64px; }
+#status { top: 50%; font-size: 26px; letter-spacing: 8px; padding: 16px 34px; }
+#slowmo { top: 50%; margin-top: -70px; color: #ffd479; border-color: rgba(255, 212, 121, 0.4); }
+.hidden { opacity: 0 !important; }
+
+/* --------------------------------------------------------------- speedo */
+#speedo {
+  position: absolute;
+  left: 26px;
+  bottom: 26px;
+}
+.dial {
+  background: var(--panel);
+  border: 1px solid var(--edge);
+  border-radius: 18px;
+  padding: 14px 22px 16px;
+  backdrop-filter: blur(8px);
+  min-width: 208px;
+}
+.dial .row { display: flex; align-items: baseline; gap: 8px; }
+#speed {
+  font-size: 62px;
+  font-weight: 800;
+  line-height: 1;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -2px;
+}
+.unit { color: var(--dim); font-size: 13px; letter-spacing: 1px; }
+.gear { color: var(--dim); font-size: 11px; letter-spacing: 2px; margin-top: 4px; }
+.gear b { color: var(--fg); font-size: 13px; }
+.bars { margin-top: 10px; display: grid; gap: 5px; }
+.bar-wrap {
+  height: 6px;
+  background: rgba(255, 255, 255, 0.07);
+  border-radius: 3px;
+  overflow: hidden;
+}
+.bar-fill { height: 100%; width: 0%; border-radius: 3px; transition: width 0.06s linear; }
+.bar-fill.power { background: linear-gradient(90deg, #3fd3a1, #7ef0c0); }
+.bar-fill.brake { background: linear-gradient(90deg, #ff6a4d, #ffb199); }
+.wheels { display: flex; gap: 6px; margin-top: 10px; }
+.wh {
+  font-size: 10px;
+  letter-spacing: 1px;
+  color: var(--dim);
+  border: 1px solid var(--edge);
+  border-radius: 5px;
+  padding: 2px 6px;
+}
+.wh.lost { color: var(--accent); border-color: rgba(255, 90, 60, 0.5); text-decoration: line-through; }
+
+/* ----------------------------------------------------------------- damage */
+#damage {
+  position: absolute;
+  right: 26px;
+  bottom: 26px;
+  width: 190px;
+  background: var(--panel);
+  border: 1px solid var(--edge);
+  border-radius: 16px;
+  padding: 12px 16px 14px;
+  backdrop-filter: blur(8px);
+  text-align: right;
+}
+#damage .label { font-size: 10px; letter-spacing: 2.5px; color: var(--dim); }
+.dmg-track {
+  height: 7px;
+  background: rgba(255, 255, 255, 0.07);
+  border-radius: 4px;
+  overflow: hidden;
+  margin: 8px 0 6px;
+}
+.dmg-fill { height: 100%; width: 0%; background: #4fb96b; transition: width 0.15s ease; }
+#damage-val { font-size: 20px; font-weight: 700; font-variant-numeric: tabular-nums; }
+
+/* ------------------------------------------------------------------- help */
+#help {
+  position: absolute;
+  top: 56px;
+  right: 20px;
+  width: 268px;
+  background: var(--panel);
+  border: 1px solid var(--edge);
+  border-radius: 14px;
+  padding: 14px 16px 12px;
+  backdrop-filter: blur(8px);
+  font-size: 12px;
+  transition: opacity 0.2s ease;
+}
+#help h2 { margin: 0 0 10px; font-size: 11px; letter-spacing: 3px; color: var(--dim); font-weight: 600; }
+#help table { width: 100%; border-collapse: collapse; }
+#help td { padding: 3px 0; color: var(--dim); vertical-align: middle; }
+#help td:first-child { width: 52%; }
+#help kbd {
+  display: inline-block;
+  min-width: 18px;
+  text-align: center;
+  background: rgba(255, 255, 255, 0.08);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-bottom-width: 2px;
+  border-radius: 4px;
+  padding: 1px 4px;
+  font-size: 10px;
+  color: #fff;
+  font-family: inherit;
+  margin-right: 2px;
+}
+#help .tip {
+  color: #6f7d8f;
+  font-size: 11px;
+  line-height: 1.5;
+  margin: 10px 0 0;
+  border-top: 1px solid var(--edge);
+  padding-top: 8px;
+}

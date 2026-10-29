@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
+<title>SoftBody Drive — a BeamNG-like sandbox</title>
+<link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+<canvas id="gl"></canvas>
+
+<div id="loading">
+  <div class="loader-box">
+    <h1>SOFTBODY<span>DRIVE</span></h1>
+    <div id="loading-text">booting…</div>
+    <div class="bar"><i></i></div>
+    <p class="tiny">soft-body vehicle physics sandbox · Tesla Model S soft cage</p>
+  </div>
+</div>
+
+<div id="ui">
+  <div id="topbar">
+    <div class="brand">SOFTBODY<span>DRIVE</span></div>
+    <div class="badges">
+      <span id="fps">60</span> fps
+      <span class="sep">·</span>
+      <span id="gmeter">0.0 g</span>
+      <span class="sep">·</span>
+      <span id="wheel-damage" class="warn"></span>
+    </div>
+  </div>
+
+  <div id="toast" class="hidden"></div>
+  <div id="status" class="hidden">PAUSED</div>
+  <div id="slowmo" class="hidden">SLOW MOTION</div>
+
+  <div id="speedo">
+    <div class="dial">
+      <div class="row"><div id="speed">0</div><div class="unit">km/h</div></div>
+      <div class="gear">GEAR <b id="gear">N</b></div>
+      <div class="bars">
+        <div class="bar-wrap"><div id="power-bar" class="bar-fill power"></div></div>
+        <div class="bar-wrap"><div id="brake-bar" class="bar-fill brake"></div></div>
+      </div>
+      <div id="wheel-status" class="wheels"></div>
+    </div>
+  </div>
+
+  <div id="damage">
+    <div class="label">DAMAGE</div>
+    <div class="dmg-track"><div id="damage-bar" class="dmg-fill"></div></div>
+    <div id="damage-val">0%</div>
+  </div>
+
+  <div id="help">
+    <h2>CONTROLS</h2>
+    <table>
+      <tr><td><kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> / arrows</td><td>drive</td></tr>
+      <tr><td><kbd>Space</kbd></td><td>handbrake</td></tr>
+      <tr><td><kbd>R</kbd></td><td>repair &amp; respawn on road</td></tr>
+      <tr><td><kbd>P</kbd></td><td>respawn on the test pad</td></tr>
+      <tr><td><kbd>C</kbd></td><td>camera mode (chase / orbit / hood)</td></tr>
+      <tr><td><kbd>T</kbd> hold</td><td>slow motion</td></tr>
+      <tr><td><kbd>G</kbd></td><td>show deformation cage</td></tr>
+      <tr><td><kbd>F</kbd></td><td>pause</td></tr>
+      <tr><td><kbd>H</kbd></td><td>hide this panel</td></tr>
+      <tr><td>mouse drag / wheel</td><td>orbit / zoom</td></tr>
+    </table>
+    <p class="tip">Hit the concrete walls on the test pad (follow the road, they are marked) at full speed — the body crumples, beams break and wheels can come off.</p>
+  </div>
+</div>
+
+<script type="module" src="src/main.js"></script>
+</body>
+</html>
