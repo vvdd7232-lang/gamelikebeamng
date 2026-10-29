@@ -1,0 +1,195 @@
+#!/usr/bin/env python3
+"""
+gen_body_nodes.py -- derive the soft-body node cage from the car mesh.
+
+The cage is a structured tube: N stations along the car (front = +z) and a
+fixed number of angular sectors per station.  For every sector we take the
+outermost body vertex of the mesh slice, which puts the cage right on the
+sheet metal.  That gives a clean, symmetric truss topology (rings + longitudinal
+beams + diagonals) which is far more stable than a hand-wired point cloud.
+
+Writes game/src/vehicle/tesla_nodes.js and a PNG debug plot of the cage.
+"""
+import json
+import math
+import os
+import struct
+import sys
+
+import numpy as np
+from PIL import Image, ImageDraw
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+# z stations (car space, front = +z)
+STATIONS = [2.33, 2.12, 1.90, 1.66, 1.38, 1.02, 0.62, 0.20,
+            -0.28, -0.76, -1.20, -1.60, -1.95, -2.20, -2.40]
+SECTORS = 16
+SLAB = 0.07
+
+
+def load_glb_mesh(path):
+    d = open(path, 'rb').read()
+    off = 12
+    js = bins = None
+    while off < len(d):
+        ln, ty = struct.unpack_from('<II', d, off)
+        off += 8
+        chunk = d[off:off + ln]
+        off += ln
+        if ty == 0x4E4F534A:
+            js = json.loads(chunk)
+        else:
+            bins = chunk
+    prims = []
+    for node in js['nodes']:
+        if 'mesh' not in node:
+            continue
+        for p in js['meshes'][node['mesh']]['primitives']:
+            a = js['accessors'][p['attributes']['POSITION']]
+            bv = js['bufferViews'][a['bufferView']]
+            arr = np.frombuffer(bins, dtype='<f4', count=a['count'] * 3,
+                                offset=bv['byteOffset']).reshape(-1, 3)
+            prims.append((node['name'], arr))
+    return prims
+
+
+def slice_section(verts, zc):
+    m = np.abs(verts[:, 2] - zc) < SLAB
+    sl = verts[m]
+    if len(sl) < 40:
+        m = np.abs(verts[:, 2] - zc) < SLAB * 3
+        sl = verts[m]
+    return sl
+
+
+def section_ring(sl, k=SECTORS):
+    """outermost point per angular sector around the section centroid"""
+    cx = float(np.median(sl[:, 0]))
+    cy = float(np.median(sl[:, 1]))
+    rel = sl[:, :2] - np.array([cx, cy])
+    ang = np.arctan2(rel[:, 1], rel[:, 0])
+    rad = np.hypot(rel[:, 0], rel[:, 1])
+    # only points that are reasonably far from the centroid make a good cage
+    rs = []
+    for i in range(k):
+        a0 = -math.pi + 2 * math.pi * i / k
+        a1 = a0 + 2 * math.pi / k
+        sel = (ang >= a0) & (ang < a1)
+        if not sel.any():
+            rs.append(None)
+            continue
+        idx = np.argmax(rad[sel])
+        rr = rad[sel][idx]
+        aa = math.atan2(rel[sel][idx][1], rel[sel][idx][0])
+        rs.append((cx + math.cos(aa) * rr, cy + math.sin(aa) * rr))
+    # fill gaps by interpolation between the neighbours
+    n = len(rs)
+    for i in range(n):
+        if rs[i] is None:
+            prev = next((rs[(i - j) % n] for j in range(1, n) if rs[(i - j) % n]), None)
+            nxt = next((rs[(i + j) % n] for j in range(1, n) if rs[(i + j) % n]), None)
+            if prev and nxt:
+                rs[i] = ((prev[0] + nxt[0]) * 0.5, (prev[1] + nxt[1]) * 0.5)
+            else:
+                rs[i] = (cx, cy + 0.4)
+    # enforce left/right mirror symmetry: for each sector pair keep the wider
+    # of the two and mirror it, so the cage is exactly symmetric
+    out = [None] * n
+    for i in range(n):
+        a = -math.pi + 2 * math.pi * (i + 0.5) / n
+        am = math.pi - a
+        am = (am + math.pi) % (2 * math.pi) - math.pi
+        j = int(round((am + math.pi) / (2 * math.pi) * n - 0.5)) % n
+        px, py = rs[i]
+        qx, qy = rs[j]
+        if abs(px) >= abs(qx):
+            x, y = abs(px), py
+        else:
+            x, y = abs(qx), qy
+        out[i] = [round(x if px >= 0 else -x, 4), round(y, 4)]
+        out[j] = [round(-(x if px >= 0 else -x), 4), round(y, 4)]
+    out = [[max(-1.0, min(1.0, p[0])), p[1]] for p in out]
+    return out, (cx, cy)
+
+
+def main():
+    prims = load_glb_mesh(os.path.join(ROOT, 'game/assets/tesla.glb'))
+    body = np.concatenate([a for n, a in prims if n == 'Body'])
+    print('body verts', len(body))
+
+    rings = []
+    stations = []
+    for zc in STATIONS:
+        sl = slice_section(body, zc)
+        ring, c = section_ring(sl)
+        rings.append([[p[0], p[1], zc] for p in ring])
+        stations.append({'z': zc, 'centroid': [round(c[0], 3), round(c[1], 3)], 'points': len(ring)})
+        ys = [p[1] for p in ring]
+        xs = [p[0] for p in ring]
+        print('z=%6.3f  x[%.2f..%.2f] y[%.2f..%.2f]' % (zc, min(xs), max(xs), min(ys), max(ys)))
+
+    out = {
+        'stations': stations,
+        'rings': rings,
+        'meta': {'sectors': SECTORS, 'source': 'Tesla_Model_S_game.fbx'},
+    }
+    dst = os.path.join(ROOT, 'game/src/vehicle/tesla_nodes.js')
+    with open(dst, 'w') as fh:
+        fh.write('// AUTO-GENERATED by tools/gen_body_nodes.py -- do not edit by hand.\n')
+        fh.write('// Structured soft-body cage: rings (sector points) x stations.\n')
+        fh.write('export const CAGE = ')
+        json.dump(out, fh, separators=(',', ':'))
+        fh.write(';\n')
+    print('wrote', dst, 'nodes', len(rings) * SECTORS)
+
+    # ---- debug plot
+    W, H = 1200, 760
+    img = Image.new('RGB', (W, H), (18, 22, 28))
+    dr = ImageDraw.Draw(img)
+    scale = 140.0
+
+    def side(p):
+        return (W * 0.5 - p[2] * scale, 300 - p[1] * scale)
+
+    def top(p):
+        return (W * 0.5 - p[2] * scale, 580 - p[0] * scale)
+
+    for name, arr in prims:
+        if name != 'Body':
+            continue
+        for v in arr[::9]:
+            dr.point(side(v), fill=(55, 65, 75))
+            dr.point(top(v), fill=(55, 65, 75))
+    for ri, ring in enumerate(rings):
+        for j, p in enumerate(ring):
+            x, y = side(p)
+            col = (90, 230, 150)
+            dr.ellipse([x - 3, y - 3, x + 3, y + 3], fill=col)
+            x2, y2 = top(p)
+            dr.ellipse([x2 - 3, y2 - 3, x2 + 3, y2 + 3], fill=(245, 190, 80))
+        # ring outline in the top view
+        pts_top = [top(p) for p in ring]
+        dr.line(pts_top + [pts_top[0]], fill=(120, 90, 40))
+        pts_side = [side(p) for p in ring]
+        dr.line(pts_side + [pts_side[0]], fill=(50, 120, 80))
+    # longitudinal beams preview
+    for i in range(len(rings) - 1):
+        for j in range(SECTORS):
+            a, b = side(rings[i][j]), side(rings[i + 1][j])
+            dr.line([a, b], fill=(40, 90, 60))
+    for wx, wz in ((0.806, 1.5696), (-0.806, 1.5696), (0.84, -1.4137), (-0.84, -1.4137)):
+        x, y = side((0, 0.3599, wz))
+        dr.ellipse([x - 0.3576 * scale, y - 0.3576 * scale,
+                    x + 0.3576 * scale, y + 0.3576 * scale], outline=(230, 90, 90))
+        x2, y2 = top((wx, 0, wz))
+        dr.rectangle([x2 - 0.18 * scale, y2 - 0.12 * scale,
+                      x2 + 0.18 * scale, y2 + 0.12 * scale], outline=(230, 90, 90))
+    dr.text((10, 10), 'side view: green = cage nodes, red = wheels', fill=(200, 220, 240))
+    dr.text((10, 350), 'top view: orange = cage nodes', fill=(200, 220, 240))
+    img.save('/tmp/cage.png')
+    print('wrote /tmp/cage.png')
+
+
+if __name__ == '__main__':
+    main()
