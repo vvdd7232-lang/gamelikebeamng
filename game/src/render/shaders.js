@@ -119,6 +119,12 @@ uniform int uSkinned;
 uniform int uNodeCount;
 uniform mat3 uBindRot;
 uniform vec3 uBindPos;
+// a body panel (door / hood / trunk / bumper) hangs on its own hinge: after
+// skinning, the whole piece is rotated about the hinge pivot and shifted
+uniform mat3 uPartRot;
+uniform vec3 uPartPivot;
+uniform vec3 uPartOffset;
+uniform int uFrozen;      // baked mesh: damage/crumple ride in aJoints.xy
 
 out vec3 vWorld;
 out vec3 vNormal;
@@ -164,10 +170,19 @@ void main() {
     n = uNormalMat * n;
     gl_Position = uViewProj * wp;
   }
+  vec3 rel = p - uPartPivot;
+  p = uPartPivot + uPartOffset + uPartRot * rel;
+  n = uPartRot * n;
   vWorld = p;
   vNormal = n;
   vColor = aColor;
   vMat = aMat;
+  if (uFrozen == 1) {
+    // a panel that was ripped off has its deformation baked into the vertex
+    // buffer; joints/weights are free to carry damage and crumple
+    damage = aJoints.x;
+    crumple = aJoints.y;
+  }
   vDamage = damage;
   vCrumple = crumple;
 }
@@ -280,13 +295,13 @@ void main() {
       // the lip of lifted paint
       float chip = dFbm(vWorld * 14.0 + 3.0) * 0.72 + dFbm(vWorld * 46.0) * 0.28;
       float chipEdge = 0.58 - gain * 0.22;
-      float chipMask = smoothstep(chipEdge, chipEdge + 0.06, chip) * clamp(gain * 1.15, 0.0, 0.76);
+      float chipMask = smoothstep(chipEdge, chipEdge + 0.06, chip) * clamp(gain * 1.05, 0.0, 0.58);
       float lip = smoothstep(chipEdge - 0.07, chipEdge, chip) * (1.0 - smoothstep(chipEdge, chipEdge + 0.03, chip));
-      vec3 bareMetal = vec3(0.27, 0.285, 0.30);
+      vec3 bareMetal = vec3(0.19, 0.20, 0.215);
       base = mix(base, bareMetal, chipMask);
       base *= 1.0 - lip * 0.55 * clamp(gain, 0.0, 1.0);
-      metal = mix(metal, 0.52, chipMask);
-      rough = mix(rough, 0.62, chipMask);
+      metal = mix(metal, 0.30, chipMask);
+      rough = mix(rough, 0.74, chipMask);
       // scratches: thin streaks that stay inside the damaged area
       float streak = dFbm(vec3(vWorld.x * 90.0, vWorld.y * 3.0, vWorld.z * 90.0) + 7.0);
       float scratch = smoothstep(0.62, 0.70, streak) * clamp(gain * 1.2, 0.0, 0.85);
@@ -364,6 +379,9 @@ uniform int uSkinned;
 uniform int uNodeCount;
 uniform mat3 uBindRot;
 uniform vec3 uBindPos;
+uniform mat3 uPartRot;
+uniform vec3 uPartPivot;
+uniform vec3 uPartOffset;
 
 void main() {
   if (uSkinned == 1) {
@@ -381,6 +399,7 @@ void main() {
       vec3 restW = texelFetch(uNodeTex, ivec2(j, 4), 0).xyz;
       acc += w * (nodePos + D * (bind - restW));
     }
+    acc = uPartPivot + uPartOffset + uPartRot * (acc - uPartPivot);
     gl_Position = uLightViewProj * vec4(acc, 1.0);
   } else {
     gl_Position = uLightViewProj * uModel * vec4(aPos, 1.0);

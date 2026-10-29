@@ -5,6 +5,7 @@
 
 import { SoftBody } from '../physics/softbody.js';
 import { buildCage, WHEEL_DEFS, CAR } from './cage.js';
+import { CAGE } from './car_nodes.js';
 import { clamp, lerp } from '../core/math.js';
 import { MATERIALS } from '../world/terrain.js';
 
@@ -153,6 +154,63 @@ export class Vehicle {
       w.wAttach = nodeWeights(this.cage.pos, attLocal, w.nodes);
       w.wContact = nodeWeights(this.cage.pos, conLocal, w.nodes);
     }
+
+    // ------------------------------------------------------------ body panels
+    // Doors, the hood, the trunk and the bumpers are real parts hanging on their
+    // own hinges (the pivots come from the model).  They crumple with the shell
+    // because they are skinned to the cage, but they also swing, sag and get
+    // torn off -- see updatePanels / detachPanel.
+    this.panels = (CAGE.parts || []).filter((p) => p.role === 'panel').map((p, i) => ({
+      index: i,
+      name: p.name,
+      pivot: p.pivot,
+      com: p.com,
+      mass: p.mass,
+      area: p.area,
+      hinge: p.hinge,
+      nodes: p.nodes,
+      bodyNodes: p.bodyNodes,
+      nodeBeams: [],
+      angle: 0,            // current rotation about the hinge axis (rad)
+      omega: 0,            // angular velocity
+      rest: 0,             // permanent bend of the hinge / mount
+      loose: 0,            // 1 = nothing holds it on any more
+      bend: 0,             // permanent twist of the hinge: a door that was hit
+                           // sits ajar by this much for the rest of its life
+      lastHit: 0,
+      detached: false,
+      pos: [0, 0, 0], vel: [0, 0, 0], quat: [0, 0, 0, 1], angVel: [0, 0, 0],
+      frozen: false,
+    }));
+    for (const p of this.panels) {
+      const beams = [];
+      for (let bi = 0; bi < this.body.nb; bi++) {
+        if (p.nodes.includes(this.body.ba[bi]) || p.nodes.includes(this.body.bb[bi])) beams.push(bi);
+      }
+      p.nodeBeams = beams;
+      // rest-space pivot in world coordinates (the shader hinges the skinned
+      // mesh about this point)
+      const toRestWorld = (v) => [
+        this.R0[0] * v[0] + this.R0[1] * v[1] + this.R0[2] * v[2] + this.spawnPos[0],
+        this.R0[3] * v[0] + this.R0[4] * v[1] + this.R0[5] * v[2] + this.spawnPos[1],
+        this.R0[6] * v[0] + this.R0[7] * v[1] + this.R0[8] * v[2] + this.spawnPos[2],
+      ];
+      p.pivotRest = toRestWorld(p.pivot);
+      p.comRest = toRestWorld(p.com);
+      const r = [p.com[0] - p.pivot[0], p.com[1] - p.pivot[1], p.com[2] - p.pivot[2]];
+      const a = p.hinge.axis;
+      const along = r[0] * a[0] + r[1] * a[1] + r[2] * a[2];
+      p.r = r;
+      // moment of inertia about the hinge line.  A hinged panel swings about a
+      // line next to it (parallel-axis term); a bumper that hangs off its own
+      // centre only spins in place, so it gets a flat-plate estimate instead.
+      const lever = r[0] * r[0] + r[1] * r[1] + r[2] * r[2] - along * along;
+      p.inertia = p.hinge.rigid
+        ? Math.max(0.6, p.mass * Math.max(0.25, p.area || 1) / 12)
+        : Math.max(0.4, p.mass * lever);
+    }
+    this.detachedPanels = [];
+    this.panelClock = 0;
 
     this.nodeTex = new Float32Array(n * 4 * 4);
     this.basis = { x: [1, 0, 0], y: [0, 1, 0], z: [0, 0, 1] };
@@ -308,6 +366,7 @@ export class Vehicle {
     this.handbrake = input.handbrake;
     this.steer = input.steer;
 
+    this.panelClock = (this.panelClock || 0) + dt;
     const steps = Math.min(9, Math.max(1, Math.round(dt / SUB_DT)));
     const h = dt / steps;
     const velPrev = this.velocity.slice();
@@ -318,6 +377,8 @@ export class Vehicle {
       this.body.step(h, this.world, this.world.colliders);
       this.drainImpacts();
       this.updateDetachedWheels(h);
+      this.updateDetachedPanels(h);
+      this.updatePanels(h);
     }
     this.updateBasis();
 
@@ -745,6 +806,212 @@ export class Vehicle {
     w._anchorRest = [ax / n, ay / n, az / n];
   }
 
+  /**
+   * Doors, hood, trunk and bumpers as bodies on hinges.
+   *
+   * Every panel has one rotational DOF about its own hinge line, torqued by
+   * gravity in the *body* frame (so a car on its roof has its doors fall open),
+   * by the relative wind when the car is moving, and by a latch spring that
+   * holds it shut until the mount around it has been destroyed.  Past that the
+   * panel flops, and past the next threshold it comes off and becomes a loose
+   * body that still tumbles on the ground.
+   */
+  updatePanels(dt) {
+    if (!this.panels.length) return;
+    const R = this.R;
+    const g = 9.81;
+    // gravity in the body frame: g_body = R^T * (0, -g, 0)
+    const gbx = -g * R[3], gby = -g * R[4], gbz = -g * R[5];
+    // relative wind in the body frame: the air the car is driving into
+    const vx = this.velocity[0], vy = this.velocity[1], vz = this.velocity[2];
+    const vbx = R[0] * vx + R[3] * vy + R[6] * vz;
+    const vby = R[1] * vx + R[4] * vy + R[7] * vz;
+    const vbz = R[2] * vx + R[5] * vy + R[8] * vz;
+    const wind = Math.hypot(vbx, vby, vbz);
+
+    for (const p of this.panels) {
+      if (p.detached) continue;
+
+      // ---- how much of the mount is left.  This latches: a panel never
+      // re-hangs itself once the metal around its hinge has been destroyed.
+      let dsum = 0;
+      for (const i of p.nodes) dsum += this.body.nodeDamage[i];
+      const dmg = dsum / Math.max(1, p.nodes.length);
+      // how destroyed the panel itself is.  The hinge can survive while the
+      // panel it holds is folded in half -- a hood does not stay on the car just
+      // because the cowl it was bolted to is intact.
+      let ssum = 0;
+      for (const i of p.bodyNodes) ssum += this.body.nodeDamage[i];
+      const skinDmg = ssum / Math.max(1, p.bodyNodes.length);
+      let torn = 0;
+      for (const bi of p.nodeBeams) if (this.body.bbroken[bi]) torn++;
+      const tear = p.nodeBeams.length ? torn / p.nodeBeams.length : 0;
+      // a bolted-on bumper lets go sooner than a door on a hinge
+      const byMount = p.hinge.rigid
+        ? (dmg - 0.15) * 1.9 + tear * 0.9
+        : (dmg - 0.20) * 1.45 + tear * 0.85;
+      const bySkin = Math.max(0, skinDmg - 0.62) * 1.7;
+      const looseTarget = clamp(Math.max(byMount, bySkin), 0, 1);
+      if (looseTarget > p.loose) p.loose = looseTarget;
+      p.lastHit = Math.max(0, p.lastHit - dt * 0.6);
+      p.mount = dmg;
+      p.skinDamage = skinDmg;
+      p.tearFrac = tear;
+
+      // ---- a bumper is welded on: it does not swing, it droops a little and
+      // then falls off.  Modelling it as a body on a hinge turned a knock into
+      // the whole nose levering around a point at the car's origin.
+      if (p.hinge.rigid) {
+        p.angle = p.hinge.open * 0.22 * p.loose * p.loose;
+        p.omega = 0;
+        p.rest = p.angle;
+        if (p.loose > 0.72 || tear > 0.45 ||
+            (p.loose > 0.55 && p.lastHit > 0.35)) {
+          this.detachPanel(p);
+        }
+        continue;
+      }
+
+      const a = p.hinge.axis;
+      const r = p.r;
+
+      // ---- torque about the hinge line.  While the latch holds it carries the
+      // panel's weight (a parked car's hood does not sag); once the mount is
+      // gone gravity is what makes a door hang open, or drop when the car ends
+      // up on its roof.
+      let torque = p.mass * (a[0] * (r[1] * gbz - r[2] * gby)
+        + a[1] * (r[2] * gbx - r[0] * gbz)
+        + a[2] * (r[0] * gby - r[1] * gbx));
+
+      // ---- a panel that is even slightly ajar is a sail
+      if (wind > 1.0 && (p.loose > 0.25 || Math.abs(p.angle) > 0.04)) {
+        const sailArea = Math.min(1.8, 0.10 * p.mass + 0.25);
+        const fw = 0.5 * 1.2 * 1.1 * sailArea * wind;
+        const fxw = -vbx * fw, fyw = -vby * fw, fzw = -vbz * fw;
+        torque += (0.30 + 0.70 * p.loose) *
+          (a[0] * (r[1] * fzw - r[2] * fyw)
+            + a[1] * (r[2] * fxw - r[0] * fzw)
+            + a[2] * (r[0] * fyw - r[1] * fxw));
+      }
+
+      // ---- the latch: overwhelming while intact, gone once the mount is dead
+      const hold = Math.pow(clamp(1 - p.loose / 0.62, 0, 1), 2.0);
+      const stiffness = p.hinge.k * hold;
+      const damping = p.hinge.damp * (0.16 + 0.84 * hold);
+      torque *= 1 - hold;
+      // a hit bends the hinge and leaves the panel permanently ajar; a dead
+      // mount lets it hang further open.  Both are absolute values (derived
+      // from state, never accumulated frame to frame) -- adding to the previous
+      // angle made every door creep all the way to its stop.
+      const restTarget = p.hinge.open * (0.45 * p.bend + 0.16 * p.loose * p.loose);
+      torque -= stiffness * (p.angle - restTarget);
+
+      // ---- hinge stops: closed (against the shell) and fully open
+      const sign = p.hinge.open < 0 ? -1 : 1;
+      const openLimit = sign * Math.abs(p.hinge.max);
+      const closedLimit = -sign * 0.06;
+
+      const sub = 2, h = dt / sub;
+      for (let k = 0; k < sub; k++) {
+        const alpha = (torque - damping * p.omega) / p.inertia;
+        p.omega += alpha * h;
+        p.angle += p.omega * h;
+        if (sign > 0) {
+          if (p.angle > openLimit) {
+            p.angle = openLimit;
+            if (p.omega > 0) {
+              if (p.omega > 3.5) p.loose = Math.min(1, p.loose + p.omega * 0.012);
+              p.omega *= -0.22;
+            }
+          } else if (p.angle < closedLimit) {
+            p.angle = closedLimit;
+            if (p.omega < 0) p.omega *= -0.2;
+          }
+        } else {
+          if (p.angle < openLimit) {
+            p.angle = openLimit;
+            if (p.omega < 0) {
+              if (-p.omega > 3.5) p.loose = Math.min(1, p.loose - p.omega * 0.012);
+              p.omega *= -0.22;
+            }
+          } else if (p.angle > closedLimit) {
+            p.angle = closedLimit;
+            if (p.omega > 0) p.omega *= -0.2;
+          }
+        }
+      }
+      // remember the bend so the damage is permanent even if the spring re-centres
+      if (p.loose > 0.45 || p.bend > 0.05) p.rest = clamp(restTarget, Math.min(0, openLimit), Math.max(0, openLimit));
+
+      // ---- torn off?  The panel lets go when the mount around the hinge has
+      // failed, or when it is already hanging by a thread and gets whipped.
+      const fastSwing = Math.abs(p.omega) > 2.6 && p.loose > 0.72;
+      const mountGone = tear > 0.80 && dmg > 0.55;
+      const hanging = p.loose > 0.90 && (tear > 0.30 || p.lastHit > 0.40);
+      // folded in half: what is left of it is scrap metal, not a hood
+      const destroyed = skinDmg > 0.82 && p.loose > 0.52;
+      if (fastSwing || mountGone || hanging || destroyed) this.detachPanel(p);
+    }
+  }
+
+  /** a hit near a panel: convert the impact into angular momentum about its hinge */
+  panelKick(x, y, z, power, normal, hard) {
+    if (!this.panels.length || power < 0.05) return;
+    this.panelClock = (this.panelClock || 0);
+    const R = this.R;
+    const c = this.center;
+    const rc = this.restCentroid;
+    for (const p of this.panels) {
+      if (p.detached) continue;
+      // world position of the panel's centre of mass (rigid prediction)
+      const rx = p.comRest[0] - rc[0], ry = p.comRest[1] - rc[1], rz = p.comRest[2] - rc[2];
+      const cx = c[0] + R[0] * rx + R[1] * ry + R[2] * rz;
+      const cy = c[1] + R[3] * rx + R[4] * ry + R[5] * rz;
+      const cz = c[2] + R[6] * rx + R[7] * ry + R[8] * rz;
+      const dx = x - cx, dy = y - cy, dz = z - cz;
+      // how far a blow can reach: a door takes a hit within its own frame,
+      // not from anywhere on the car
+      const reach = 0.55 + Math.sqrt(Math.max(p.inertia, 0.2)) * 0.42;
+      const dist = Math.hypot(dx, dy, dz);
+      if (dist > reach) continue;
+      // one blow per impact, not one per solver substep
+      if (p._kickAt !== undefined && this.panelClock - p._kickAt < 0.12) continue;
+      p._kickAt = this.panelClock;
+      p.lastHit = Math.max(p.lastHit, power * (1 - dist / reach));
+      const falloff = (1 - dist / reach) ** 1.6;
+      // a whack dents the mount a little; destroying it is the cage's job
+      if (power > 0.5) {
+        p.loose = Math.min(1, p.loose + power * 0.02 * falloff * (hard ? 1.5 : 1));
+      }
+      // and it twists the hinge: the panel never quite shuts again
+      if (!p.hinge.rigid) {
+        p.bend = Math.min(1, p.bend + power * falloff * 0.55 * (hard ? 1.2 : 0.7));
+      }
+      if (p.hinge.rigid) continue;
+      const a = p.hinge.axis;
+      const ax = R[0] * a[0] + R[1] * a[1] + R[2] * a[2];
+      const ay = R[3] * a[0] + R[4] * a[1] + R[5] * a[2];
+      const az = R[6] * a[0] + R[7] * a[1] + R[8] * a[2];
+      // direction of the blow: the contact normal, or "away from the hit"
+      let fx, fy, fz;
+      if (normal) {
+        fx = normal[0]; fy = normal[1]; fz = normal[2];
+      } else {
+        const l = dist || 1;
+        fx = -dx / l; fy = -dy / l; fz = -dz / l;
+      }
+      // lever arm from the hinge pivot to the contact
+      const lx = x - p.pivotRest[0], ly = y - p.pivotRest[1], lz = z - p.pivotRest[2];
+      const tx = ly * fz - lz * fy;
+      const ty = lz * fx - lx * fz;
+      const tz = lx * fy - ly * fx;
+      const axisTorque = ax * tx + ay * ty + az * tz;
+      // power is 0..1; scale to a believable angular kick for the panel's inertia
+      const kick = (axisTorque * power * falloff * 9.0) / Math.max(0.4, p.inertia);
+      p.omega += clamp(kick, -26, 26);
+    }
+  }
+
   /** damage bookkeeping: panels, safety cell, wheels, drivetrain, lights */
   updateDamage(dt) {
     const b = this.body;
@@ -832,19 +1099,88 @@ export class Vehicle {
     this.detachedCount = this.wheels.filter((w) => w.detached).length;
 
     // headline severity for the player: shell + lost wheels + a broken safety
-    // cell.  A car that has lost both front wheels is "badly damaged" even when
-    // the paint on the doors is still perfect.
+    // cell + torn-off body panels.  A car with its hood, its bumper and a door
+    // lying on the road is a wreck even if the paint on the other side is fine.
     const lostWheels = this.detachedCount;
+    const lostPanels = this.detachedPanels ? this.detachedPanels.length : 0;
     this.damage = clamp(
-      this.shellDamage * 0.85
+      this.shellDamage * 0.72
       + lostWheels * 0.10
-      + (1 - this.cabinIntegrity) * 1.20
-      + this.wheelDamage * 0.10,
+      + (1 - this.cabinIntegrity) * 1.10
+      + this.wheelDamage * 0.10
+      + lostPanels * 0.055,
       0, 1);
     this.structural = 1 - this.shellDamage;
     if (this.damage > prev + 0.002 && this.impactFlash < 0.35) this.impactFlash = 0.35;
 
     this.impactTimer = Math.max(0, (this.impactTimer || 0) - dt);
+  }
+
+  /** tear a panel off: it becomes a loose body that keeps tumbling */
+  detachPanel(p) {
+    if (p.detached) return null;
+    p.detached = true;
+    const R = this.R;
+    const c = this.center;
+    const rc = this.restCentroid;
+    const rx = p.comRest[0] - rc[0], ry = p.comRest[1] - rc[1], rz = p.comRest[2] - rc[2];
+    p.pos[0] = c[0] + R[0] * rx + R[1] * ry + R[2] * rz;
+    p.pos[1] = c[1] + R[3] * rx + R[4] * ry + R[5] * rz;
+    p.pos[2] = c[2] + R[6] * rx + R[7] * ry + R[8] * rz;
+    this.body.velNear(p.pos[0], p.pos[1], p.pos[2], _tmp);
+    p.vel = [_tmp[0], Math.max(_tmp[1], 0.2) + 0.8, _tmp[2]];
+    // the swing it had at the moment it let go, plus a tumble
+    const a = p.hinge.axis;
+    const ax = R[0] * a[0] + R[1] * a[1] + R[2] * a[2];
+    const ay = R[3] * a[0] + R[4] * a[1] + R[5] * a[2];
+    const az = R[6] * a[0] + R[7] * a[1] + R[8] * a[2];
+    const w = clamp(p.omega, -18, 18);
+    p.angVel = [ax * w + (Math.random() - 0.5) * 3,
+      ay * w + (Math.random() - 0.5) * 3,
+      az * w + (Math.random() - 0.5) * 3];
+    p.quat = [0, 0, 0, 1];
+    p.radius = 0.45 + Math.sqrt(Math.max(p.inertia, 0.2)) * 0.35;
+    this.detachedPanels.push(p);
+    this.impacts.push({
+      x: p.pos[0], y: p.pos[1], z: p.pos[2], power: 0.42,
+      normal: [0, 1, 0], tear: true, speed: 0, panel: p.name,
+    });
+    return p;
+  }
+
+  /** loose panels: gravity, bouncing, tumbling, coming to rest */
+  updateDetachedPanels(dt) {
+    if (!this.detachedPanels.length) return;
+    for (const p of this.detachedPanels) {
+      p.vel[1] -= 9.81 * dt;
+      p.pos[0] += p.vel[0] * dt;
+      p.pos[1] += p.vel[1] * dt;
+      p.pos[2] += p.vel[2] * dt;
+      const R = p.radius;
+      const ground = this.world.heightAt(p.pos[0], p.pos[2]) + R * 0.62;
+      if (p.pos[1] < ground) {
+        p.pos[1] = ground;
+        if (p.vel[1] < 0) p.vel[1] = -p.vel[1] * 0.24;
+        if (p.vel[1] < 0.55) p.vel[1] = 0;
+        const f = Math.max(0, 1 - 3.0 * dt);
+        p.vel[0] *= f; p.vel[2] *= f;
+        const d = Math.max(0, 1 - 4.0 * dt);
+        p.angVel[0] *= d; p.angVel[1] *= d; p.angVel[2] *= d;
+        if (Math.hypot(p.vel[0], p.vel[2]) < 0.2 && Math.hypot(p.angVel[0], p.angVel[1], p.angVel[2]) < 0.4) {
+          p.vel[0] = 0; p.vel[2] = 0;
+          p.angVel[0] = 0; p.angVel[1] = 0; p.angVel[2] = 0;
+        }
+      }
+      const [qx, qy, qz, qw] = p.quat;
+      const [ax, ay, az] = p.angVel;
+      const h = dt * 0.5;
+      const nx = qx + h * (ax * qw + ay * qz - az * qy);
+      const ny = qy + h * (ay * qw + az * qx - ax * qz);
+      const nz = qz + h * (az * qw + ax * qy - ay * qx);
+      const nw = qw + h * (-ax * qx - ay * qy - az * qz);
+      const l = Math.hypot(nx, ny, nz, nw) || 1;
+      p.quat[0] = nx / l; p.quat[1] = ny / l; p.quat[2] = nz / l; p.quat[3] = nw / l;
+    }
   }
 
   /** pull the impact events out of the solver right after a substep */
@@ -860,13 +1196,28 @@ export class Vehicle {
         this.lastImpactSpeed = e.power * 22 * 3.6;
         this.impactTimer = 1.4;
       }
+      // only a solid hit knocks a panel loose -- scraping the underbody over a
+      // kerb should not swing the doors
+      if (e.power > 0.28 && (Math.abs(e.normal[1]) < 0.75 || e.power > 0.6)) {
+        this.panelKick(e.x, e.y, e.z, e.power, e.normal, true);
+      }
       b.contactEvent = null;
     }
     for (const ev of b.events) {
       this.impacts.push({ x: ev.x, y: ev.y, z: ev.z, power: ev.power * 0.8, tear: true, speed: 0 });
+      if (ev.power > 0.5) this.panelKick(ev.x, ev.y, ev.z, ev.power * 0.8, null, false);
     }
     if (b.events.length) b.events.length = 0;
     if (this.impacts.length > 64) this.impacts.splice(0, this.impacts.length - 64);
+  }
+
+  /** panels torn off since the last call (for dust / debris effects) */
+  takeDetachedPanels() {
+    // `detachedPanels` is the persistent list the renderer draws; this only
+    // hands out the ones that left since the last call
+    const fresh = this.detachedPanels.filter((p) => !p._announced);
+    for (const p of fresh) p._announced = true;
+    return fresh;
   }
 
   /** wheels torn off since the last call (for dust / debris effects) */
@@ -998,6 +1349,12 @@ export class Vehicle {
     this.detachedProps.length = 0;
     this.wheelDamage = 0;
     this.detachedCount = 0;
+    for (const p of this.panels) {
+      p.angle = 0; p.omega = 0; p.rest = 0; p.loose = 0; p.bend = 0;
+      p.detached = false; p.frozen = false; p.lastHit = 0; p._announced = false;
+      p.pos = [0, 0, 0]; p.vel = [0, 0, 0]; p.quat = [0, 0, 0, 1]; p.angVel = [0, 0, 0];
+    }
+    this.detachedPanels.length = 0;
     this.rotQuat[0] = 1; this.rotQuat[1] = 0; this.rotQuat[2] = 0; this.rotQuat[3] = 0;
     this.center[0] = this.spawnPos[0];
     this.center[1] = this.spawnPos[1];

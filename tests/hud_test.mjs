@@ -89,18 +89,27 @@ hud.update({
   wheelRim: [1, 1, 0.6, 0.1],
   wheelStates: [true, true, false, false],
   detached: 2,
+  lostPanels: ['Hood', 'Bumper_Front', 'Door_FL'],
   impact: 103,
 });
 const wrecked = els.get('damage-val').textContent;
 if (wrecked !== '98%') fail(`wrecked damage shows "${wrecked}" instead of 98%`);
 if (els.get('wheels-val').textContent !== '2/4') fail('wheel counter wrong: ' + els.get('wheels-val').textContent);
-if (!String(els.get('wheel-damage').textContent).includes('2 WHEELS LOST')) fail('wheel-loss line missing: ' + els.get('wheel-damage').textContent);
+const wd = String(els.get('wheel-damage').textContent);
+if (!wd.includes('2 WHEELS LOST')) fail('wheel-loss line missing: ' + wd);
+if (!wd.includes('3 PANELS OFF')) fail('panel-loss line missing: ' + wd);
 if (els.get('engine-val').textContent !== '8%') fail('power readout wrong: ' + els.get('engine-val').textContent);
 for (const z of [0, 1, 2, 3, 4, 5]) {
   const el = els.get('zn-' + z);
   if (!el.style.fill || !el.style.fill.startsWith('rgb')) fail(`zone ${z} has no colour`);
 }
 if (String(els.get('impact-kmh').textContent) !== '103') fail('impact banner did not update: ' + els.get('impact-kmh').textContent);
+
+// a single lost panel is named, and a hanging panel is called out
+hud.update({ ...pristine, lostPanels: ['Hood'] });
+if (!/HOOD OFF/.test(String(els.get('wheel-damage').textContent))) fail('single panel not named: ' + els.get('wheel-damage').textContent);
+hud.update({ ...pristine, loosePanels: 2 });
+if (!/PANEL HANGING/.test(String(els.get('wheel-damage').textContent))) fail('hanging panel not reported: ' + els.get('wheel-damage').textContent);
 
 // NaN / missing optional fields must not throw or print "NaN"
 hud.update({ ...pristine, damage: NaN, zones: undefined, wheelRim: undefined, cabin: undefined });

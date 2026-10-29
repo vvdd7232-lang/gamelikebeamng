@@ -228,15 +228,28 @@ def shade_mesh(call, mesh_cache, node_tex, background, depth, color):
             # spare .w channels: node damage (row 0) and crumple (row 3)
             damage += wgt[:, 0] * tex[(0 * w + j) * 4 + 3]
             crumple += wgt[:, 0] * tex[(3 * w + j) * 4 + 3]
+        # hinge: a door / hood / trunk rotates about its own pivot after
+        # skinning, exactly as uPartRot / uPartPivot do in MESH_VS
+        part_rot = mat3(u(call, 'uPartRot')) if 'uPartRot' in call.get('uniforms', {}) else np.eye(3)
+        pivot = u(call, 'uPartPivot') if 'uPartPivot' in call.get('uniforms', {}) else np.zeros(3)
+        offset = u(call, 'uPartOffset') if 'uPartOffset' in call.get('uniforms', {}) else np.zeros(3)
+        acc = pivot[None, :] + offset[None, :] + (acc - pivot[None, :]) @ part_rot.T
         world_pos = acc
-        # normal: (accD * uBindRot) * aNormal
+        # normal: (accD * uBindRot) * aNormal, then the hinge rotation
         nmat = np.einsum('nij,jk->nik', accD, bind_rot)
-        world_nrm = np.einsum('nij,nj->ni', nmat, nrm)
+        world_nrm = np.einsum('nij,nj->ni', nmat, nrm) @ part_rot.T
     else:
         world_pos = pos @ model[:3, :3].T + model[:3, 3]
         world_nrm = nrm @ model[:3, :3].T
-        damage = np.zeros(len(pos))
-        crumple = np.zeros(len(pos))
+        # a ripped-off panel is drawn rigidly with its crumple baked into the
+        # free joint slots (uFrozen)
+        if int(u(call, 'uFrozen', 0)):
+            jj = attribute(vbuf, a['4'], 4).astype(np.float64)
+            damage = jj[:, 0]
+            crumple = jj[:, 1]
+        else:
+            damage = np.zeros(len(pos))
+            crumple = np.zeros(len(pos))
 
     # project
     hom = np.concatenate([world_pos, np.ones((len(world_pos), 1))], axis=1)
@@ -351,15 +364,15 @@ def shade_pbr(call, tri, sx, sy, sz, wpos, wnrm, col, mat, background, depth, co
         # painted panels: chips to bare aluminium, lifted-paint lips, scratches
         chip = vfbm(ctr * 14.0 + 3.0) * 0.72 + vfbm(ctr * 46.0) * 0.28
         edge = 0.58 - gain * 0.22
-        chip_mask = np.clip((chip - edge) / 0.06, 0, 1) * np.clip(gain * 1.15, 0, 0.76)
+        chip_mask = np.clip((chip - edge) / 0.06, 0, 1) * np.clip(gain * 1.05, 0, 0.58)
         lip = (np.clip((chip - (edge - 0.07)) / 0.07, 0, 1)
                * (1 - np.clip((chip - edge) / 0.03, 0, 1)) * np.clip(gain, 0, 1))
-        bare = np.array([0.27, 0.285, 0.30])
+        bare = np.array([0.19, 0.20, 0.215])
         pm = (~glass)[:, None]
         base = np.where(pm, base * (1 - chip_mask[:, None]) + bare[None, :] * chip_mask[:, None], base)
         base = np.where(pm, base * (1 - (lip * 0.55)[:, None]), base)
-        metal = np.where(pm[:, 0], metal * (1 - chip_mask) + 0.52 * chip_mask, metal)
-        rough = np.where(pm[:, 0], rough * (1 - chip_mask) + 0.62 * chip_mask, rough)
+        metal = np.where(pm[:, 0], metal * (1 - chip_mask) + 0.30 * chip_mask, metal)
+        rough = np.where(pm[:, 0], rough * (1 - chip_mask) + 0.74 * chip_mask, rough)
         streak = vfbm(np.stack([ctr[:, 0] * 90.0, ctr[:, 1] * 3.0, ctr[:, 2] * 90.0], axis=1) + 7.0)
         scratch = np.clip((streak - 0.62) / 0.08, 0, 1) * np.clip(gain * 1.2, 0, 0.85)
         base = np.where(pm, base * (1 - (scratch * 0.6)[:, None])

@@ -62,6 +62,7 @@ export class Renderer {
     this.width = canvas.width;
     this.height = canvas.height;
 
+    this.identity3 = new Float32Array([1, 0, 0, 0, 1, 0, 0, 0, 1]);
     this.progSky = createProgram(gl, S.SKY_VS, S.SKY_FS, 'sky');
     this.progMesh = createProgram(gl, S.MESH_VS, S.MESH_FS, 'mesh');
     this.progDepth = createProgram(gl, S.DEPTH_VS, S.DEPTH_FS, 'depth');
@@ -395,14 +396,21 @@ export class Renderer {
       { loc: 0, size: 3 }, { loc: 1, size: 3 }, { loc: 2, size: 3 },
       { loc: 3, size: 3 }, { loc: 4, size: 4 }, { loc: 5, size: 4 },
     ];
-    this.carGeometry = { bodies: [], wheels: {} };
+    this.carGeometry = { bodies: [], wheels: {}, layout: [] };
     for (const prim of geom.bodies) {
       this.carGeometry.bodies.push({
         mesh: createMesh(gl, layout, prim.data, prim.indices || null, gl.TRIANGLES, 'body:' + prim.name),
         emissive: prim.emissive,
         name: prim.name,
+        // kept so a ripped-off panel can be baked into a stand-alone mesh (with
+        // its crumple frozen in) the moment it leaves the car
+        raw: prim.data,
+        stride: prim.stride || 20,
+        vertexCount: prim.vertexCount,
+        indices: prim.indices || null,
       });
     }
+    this.carGeometry.layout = layout;
     for (const w of geom.wheels) {
       const prims = [];
       for (const p of w.prims) {
@@ -431,6 +439,10 @@ export class Renderer {
     for (const w of vehicle.wheels) {
       inst.wheelMats.set(w.name, mat4.create());
     }
+    inst.partRot = new Float32Array([1, 0, 0, 0, 1, 0, 0, 0, 1]);
+    inst.frozen = new Map();
+    inst.panels = new Map();
+    for (const p of vehicle.panels || []) inst.panels.set(p.name, p);
     this.vehicleInstances.set(vehicle, inst);
     return inst;
   }
@@ -446,6 +458,10 @@ export class Renderer {
       inst.bindRot[0] = R0[0]; inst.bindRot[1] = R0[3]; inst.bindRot[2] = R0[6];
       inst.bindRot[3] = R0[1]; inst.bindRot[4] = R0[4]; inst.bindRot[5] = R0[7];
       inst.bindRot[6] = R0[2]; inst.bindRot[7] = R0[5]; inst.bindRot[8] = R0[8];
+    }
+    if (inst.panels.size !== (vehicle.panels || []).length) {
+      inst.panels = new Map();
+      for (const p of vehicle.panels || []) inst.panels.set(p.name, p);
     }
     packNodeData(vehicle, inst.nodeData);
     inst.dirty = true;
@@ -503,6 +519,156 @@ export class Renderer {
       m[12 + row] = t;
     }
     m[3] = 0; m[7] = 0; m[11] = 0; m[15] = 1;
+    return m;
+  }
+
+  // ------------------------------------------------------------- part hinges
+  /** world position of a hinge pivot for the current pose */
+  panelPivot(vehicle, p, out) {
+    const R = vehicle.R;
+    const rc = vehicle.restCentroid;
+    const dx = p.pivotRest[0] - rc[0], dy = p.pivotRest[1] - rc[1], dz = p.pivotRest[2] - rc[2];
+    const c = vehicle.center;
+    out[0] = c[0] + R[0] * dx + R[1] * dy + R[2] * dz;
+    out[1] = c[1] + R[3] * dx + R[4] * dy + R[5] * dz;
+    out[2] = c[2] + R[6] * dx + R[7] * dy + R[8] * dz;
+    return out;
+  }
+
+  /** rotation (column-major mat3) of a hinged panel for the current pose */
+  panelRotation(vehicle, p, out) {
+    const R = vehicle.R;
+    const a = p.hinge.axis;
+    // the hinge axis in world space: the body rotation applied to the car-space axis
+    const ax = R[0] * a[0] + R[1] * a[1] + R[2] * a[2];
+    const ay = R[3] * a[0] + R[4] * a[1] + R[5] * a[2];
+    const az = R[6] * a[0] + R[7] * a[1] + R[8] * a[2];
+    const th = p.angle || 0;
+    const c = Math.cos(th), s = Math.sin(th), t = 1 - c;
+    // Rodrigues, column-major for the shader
+    out[0] = c + ax * ax * t;
+    out[1] = ay * ax * t + az * s;
+    out[2] = az * ax * t - ay * s;
+    out[3] = ax * ay * t - az * s;
+    out[4] = c + ay * ay * t;
+    out[5] = az * ay * t + ax * s;
+    out[6] = ax * az * t + ay * s;
+    out[7] = ay * az * t - ax * s;
+    out[8] = c + az * az * t;
+    return out;
+  }
+
+  /**
+   * Bake a panel that has just been ripped off into its own mesh.
+   *
+   * The panel keeps the crumple it had at that instant (skinning is evaluated
+   * here on the CPU and written into the vertex buffer, with the per-vertex
+   * damage riding in the free joint/weight slots), so it flies away looking
+   * like a mangled door instead of snapping back to a clean, straight one.
+   */
+  bakePanel(vehicle, inst, p) {
+    const gl = this.gl;
+    if (p.bakedMeshes && p.bakedMeshes.length) {
+      for (const m of p.bakedMeshes) {
+        if (m.mesh && m.mesh.vao) gl.deleteVertexArray(m.mesh.vao);
+      }
+      p.bakedMeshes = null;
+    }
+    const layout = this.carGeometry.layout;
+    const out = [];
+    const pivot = [0, 0, 0];
+    this.panelPivot(vehicle, p, pivot);
+    const rot = new Float32Array(9);
+    this.panelRotation(vehicle, p, rot);
+    // part transform: p' = pivot + R * (p - pivot)
+    let cx = 0, cy = 0, cz = 0, total = 0;
+    for (const prim of this.carGeometry.bodies) {
+      if (prim.name !== p.name) continue;
+      const src = prim.raw;
+      const stride = prim.stride;
+      const nv = src.length / stride;
+      const baked = new Float32Array(src);
+      for (let v = 0; v < nv; v++) {
+        const o = v * stride;
+        // ---- skin one vertex exactly like MESH_VS does
+        let px = 0, py = 0, pz = 0;
+        let dmg = 0, crumple = 0;
+        const d0 = [0, 0, 0], d1 = [0, 0, 0], d2 = [0, 0, 0];
+        const bind = [
+          inst.bindRot[0] * src[o] + inst.bindRot[3] * src[o + 1] + inst.bindRot[6] * src[o + 2] + inst.bindPos[0],
+          inst.bindRot[1] * src[o] + inst.bindRot[4] * src[o + 1] + inst.bindRot[7] * src[o + 2] + inst.bindPos[1],
+          inst.bindRot[2] * src[o] + inst.bindRot[5] * src[o + 1] + inst.bindRot[8] * src[o + 2] + inst.bindPos[2],
+        ];
+        for (let j = 0; j < 4; j++) {
+          const w = src[o + 16 + j];
+          if (w <= 0) continue;
+          const node = src[o + 12 + j] | 0;
+          const base = MAX_NODES * 4;
+          const r0 = node * 4, r1 = base + node * 4, r2 = base * 2 + node * 4, r3 = base * 3 + node * 4;
+          const r4 = base * 4 + node * 4;
+          const npx = inst.nodeData[r0], npy = inst.nodeData[r0 + 1], npz = inst.nodeData[r0 + 2];
+          const c0x = inst.nodeData[r1], c0y = inst.nodeData[r1 + 1], c0z = inst.nodeData[r1 + 2];
+          const c1x = inst.nodeData[r2], c1y = inst.nodeData[r2 + 1], c1z = inst.nodeData[r2 + 2];
+          const c2x = inst.nodeData[r3], c2y = inst.nodeData[r3 + 1], c2z = inst.nodeData[r3 + 2];
+          const rx = bind[0] - inst.nodeData[r4], ry = bind[1] - inst.nodeData[r4 + 1], rz = bind[2] - inst.nodeData[r4 + 2];
+          const sx = c0x * rx + c1x * ry + c2x * rz;
+          const sy = c0y * rx + c1y * ry + c2y * rz;
+          const sz = c0z * rx + c1z * ry + c2z * rz;
+          px += w * (npx + sx); py += w * (npy + sy); pz += w * (npz + sz);
+          d0[0] += w * c0x; d0[1] += w * c0y; d0[2] += w * c0z;
+          d1[0] += w * c1x; d1[1] += w * c1y; d1[2] += w * c1z;
+          d2[0] += w * c2x; d2[1] += w * c2y; d2[2] += w * c2z;
+          dmg += w * inst.nodeData[r0 + 3];
+          crumple += w * inst.nodeData[r3 + 3];
+        }
+        // hinge rotation about the pivot
+        const rxp = px - pivot[0], ryp = py - pivot[1], rzp = pz - pivot[2];
+        px = pivot[0] + rot[0] * rxp + rot[3] * ryp + rot[6] * rzp;
+        py = pivot[1] + rot[1] * rxp + rot[4] * ryp + rot[7] * rzp;
+        pz = pivot[2] + rot[2] * rxp + rot[5] * ryp + rot[8] * rzp;
+        // normal: (accD * bindRot) * n, then the same hinge rotation
+        const bx = inst.bindRot[0] * src[o + 3] + inst.bindRot[3] * src[o + 4] + inst.bindRot[6] * src[o + 5];
+        const by = inst.bindRot[1] * src[o + 3] + inst.bindRot[4] * src[o + 4] + inst.bindRot[7] * src[o + 5];
+        const bz = inst.bindRot[2] * src[o + 3] + inst.bindRot[5] * src[o + 4] + inst.bindRot[8] * src[o + 5];
+        let nx = d0[0] * bx + d1[0] * by + d2[0] * bz;
+        let ny = d0[1] * bx + d1[1] * by + d2[1] * bz;
+        let nz = d0[2] * bx + d1[2] * by + d2[2] * bz;
+        const hx = rot[0] * nx + rot[3] * ny + rot[6] * nz;
+        const hy = rot[1] * nx + rot[4] * ny + rot[7] * nz;
+        const hz = rot[2] * nx + rot[5] * ny + rot[8] * nz;
+        const nl = Math.hypot(hx, hy, hz) || 1;
+        baked[o] = px; baked[o + 1] = py; baked[o + 2] = pz;
+        baked[o + 3] = hx / nl; baked[o + 4] = hy / nl; baked[o + 5] = hz / nl;
+        // junk the skinning weights: a loose panel is drawn rigidly
+        baked[o + 12] = clamp(dmg, 0, 1);      // aJoints.x carries the damage now
+        baked[o + 13] = clamp(crumple, 0, 1);
+        baked[o + 14] = 0; baked[o + 15] = 0;
+        baked[o + 16] = 0; baked[o + 17] = 0; baked[o + 18] = 0; baked[o + 19] = 0;
+        cx += px; cy += py; cz += pz; total++;
+      }
+      out.push({
+        mesh: createMesh(gl, layout, baked, prim.indices || null, gl.TRIANGLES, 'loose:' + p.name),
+        emissive: prim.emissive,
+        indices: prim.indices || null,
+        data: baked,
+      });
+    }
+    if (!total) return null;
+    p.frozen = true;
+    p.bakedCentroid = [cx / total, cy / total, cz / total];
+    p.bakedMeshes = out;
+    return out;
+  }
+
+  /** the model matrix of a panel that is no longer attached to the car */
+  loosePanelMatrix(p, out) {
+    const m = out || mat4.create();
+    quatToMat4(p.quat || [0, 0, 0, 1], m);
+    const c0 = p.bakedCentroid || [0, 0, 0];
+    // rotate about the baked centroid, then move it to where the body is now
+    for (let i = 0; i < 3; i++) {
+      m[12 + i] = p.pos[i] - (m[i] * c0[0] + m[4 + i] * c0[1] + m[8 + i] * c0[2]);
+    }
     return m;
   }
 
@@ -644,6 +810,7 @@ export class Renderer {
     }
     if (this.carGeometry) {
       gl.uniform1i(uDepth.uSkinned, 1);
+      const pivotTmp = [0, 0, 0];
       for (const vehicle of vehicles) {
         const inst = this.vehicleInstances.get(vehicle);
         if (!inst) continue;
@@ -653,11 +820,26 @@ export class Renderer {
         gl.bindTexture(gl.TEXTURE_2D, this.nodeTex);
         gl.uniform1i(uDepth.uNodeTex, 0);
         gl.uniform1i(uDepth.uNodeCount, vehicle.nodeCount);
+        gl.uniform3f(uDepth.uPartOffset, 0, 0, 0);
         for (const prim of this.carGeometry.bodies) {
+          const panel = inst.panels.get(prim.name);
+          if (panel) {
+            if (panel.detached) continue;
+            this.panelPivot(vehicle, panel, pivotTmp);
+            this.panelRotation(vehicle, panel, inst.partRot);
+            gl.uniformMatrix3fv(uDepth.uPartRot, false, inst.partRot);
+            gl.uniform3f(uDepth.uPartPivot, pivotTmp[0], pivotTmp[1], pivotTmp[2]);
+          } else {
+            gl.uniformMatrix3fv(uDepth.uPartRot, false, this.identity3);
+            gl.uniform3f(uDepth.uPartPivot, 0, 0, 0);
+          }
           gl.bindVertexArray(prim.mesh.vao);
           gl.drawElements(prim.mesh.mode, prim.mesh.count, prim.mesh.indexType, 0);
         }
       }
+      gl.uniformMatrix3fv(uDepth.uPartRot, false, this.identity3);
+      gl.uniform3f(uDepth.uPartPivot, 0, 0, 0);
+      gl.uniform3f(uDepth.uPartOffset, 0, 0, 0);
     }
 
     // ---------------- main pass
@@ -740,10 +922,28 @@ export class Renderer {
         gl.uniformMatrix3fv(u.uBindRot, false, inst.bindRot);
         gl.uniform3fv(u.uBindPos, inst.bindPos);
 
-        // body
+        // body.  Panels (doors, hood, trunk, bumpers) carry their own hinge
+        // rotation; a panel that has been ripped off is not drawn here at all --
+        // it comes back later as a loose body with its crumple baked in.
         gl.disable(gl.CULL_FACE);
+        gl.uniform1i(u.uFrozen, 0);
+        const identityRot = this.identity3;
+        const pivotTmp = [0, 0, 0];
         for (const prim of this.carGeometry.bodies) {
           if (prim.emissive) continue;
+          const panel = inst.panels.get(prim.name);
+          if (panel) {
+            if (panel.detached) continue;
+            this.panelPivot(vehicle, panel, pivotTmp);
+            this.panelRotation(vehicle, panel, inst.partRot);
+            gl.uniformMatrix3fv(u.uPartRot, false, inst.partRot);
+            gl.uniform3f(u.uPartPivot, pivotTmp[0], pivotTmp[1], pivotTmp[2]);
+            gl.uniform3f(u.uPartOffset, 0, 0, 0);
+          } else {
+            gl.uniformMatrix3fv(u.uPartRot, false, identityRot);
+            gl.uniform3f(u.uPartPivot, 0, 0, 0);
+            gl.uniform3f(u.uPartOffset, 0, 0, 0);
+          }
           gl.bindVertexArray(prim.mesh.vao);
           gl.drawElements(prim.mesh.mode, prim.mesh.count, prim.mesh.indexType, 0);
         }
@@ -753,11 +953,43 @@ export class Renderer {
         gl.uniform3f(u.uEmissive, 0.9 * lights, 0.85 * lights, 0.72 * lights);
         for (const prim of this.carGeometry.bodies) {
           if (!prim.emissive) continue;
+          const panel = inst.panels.get(prim.name);
+          if (panel) {
+            if (panel.detached) continue;
+            this.panelPivot(vehicle, panel, pivotTmp);
+            this.panelRotation(vehicle, panel, inst.partRot);
+            gl.uniformMatrix3fv(u.uPartRot, false, inst.partRot);
+            gl.uniform3f(u.uPartPivot, pivotTmp[0], pivotTmp[1], pivotTmp[2]);
+          } else {
+            gl.uniformMatrix3fv(u.uPartRot, false, identityRot);
+            gl.uniform3f(u.uPartPivot, 0, 0, 0);
+          }
           gl.bindVertexArray(prim.mesh.vao);
           gl.drawElements(prim.mesh.mode, prim.mesh.count, prim.mesh.indexType, 0);
         }
         gl.uniform3f(u.uEmissive, 0, 0, 0);
+        gl.uniformMatrix3fv(u.uPartRot, false, identityRot);
+        gl.uniform3f(u.uPartPivot, 0, 0, 0);
+        gl.uniform3f(u.uPartOffset, 0, 0, 0);
         gl.uniform1i(u.uSkinned, 0);
+
+        // ---- panels that came off: rigid bodies with their damage frozen in
+        if (vehicle.detachedPanels && vehicle.detachedPanels.length) {
+          gl.uniform1i(u.uFrozen, 1);
+          for (const p of vehicle.detachedPanels) {
+            if (!p.bakedMeshes) this.bakePanel(vehicle, inst, p);
+            if (!p.bakedMeshes) continue;
+            this.loosePanelMatrix(p, this.model);
+            gl.uniformMatrix4fv(u.uModel, false, this.model);
+            for (const baked of p.bakedMeshes) {
+              gl.bindVertexArray(baked.mesh.vao);
+              gl.drawElements(baked.mesh.mode, baked.mesh.count, baked.mesh.indexType, 0);
+            }
+          }
+          gl.uniform1i(u.uFrozen, 0);
+          gl.uniformMatrix4fv(u.uModel, false, this.model);
+          gl.uniform1i(u.uSkinned, skinnable ? 1 : 0);
+        }
 
         // wheels (rigid)
         gl.enable(gl.CULL_FACE);

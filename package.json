@@ -5,9 +5,9 @@
   "type": "commonjs",
   "scripts": {
     "start": "node serve.js 8080",
-    "test": "node tests/physics_test.mjs && node tests/damage_test.mjs && node tests/hud_test.mjs && node tests/skinning_test.mjs && node tests/node_texture_test.mjs && node tests/shader_contract_test.mjs && node tests/render_texture_test.mjs && node tests/gl_state_test.mjs && node tests/render_smoke.mjs",
-    "convert": "python3 tools/fbx2glb.py Tesla_Model_S_game.fbx game/assets/tesla.glb",
-    "cage": "python3 tools/gen_body_nodes.py",
+    "test": "node tests/physics_test.mjs && node tests/damage_test.mjs && node tests/panels_test.mjs && node tests/hud_test.mjs && node tests/skinning_test.mjs && node tests/node_texture_test.mjs && node tests/shader_contract_test.mjs && node tests/render_texture_test.mjs && node tests/gl_state_test.mjs && node tests/render_smoke.mjs",
+    "convert": "python3 tools/fbx2glb_parts.py Volvo_S90_optimized.fbx game/assets/volvo.glb",
+    "cage": "python3 tools/gen_cage.py game/assets/volvo.glb",
     "test:physics": "node tests/physics_test.mjs",
     "test:skin": "node tests/skinning_test.mjs",
     "test:render": "node tests/render_smoke.mjs",
@@ -17,7 +17,9 @@
     "test:state": "node tests/render_texture_test.mjs && node tests/gl_state_test.mjs",
     "test:damage": "node tests/damage_test.mjs",
     "test:hud": "node tests/hud_test.mjs",
-    "crash": "SCENARIO=crash IMPACT=100 CRASH_T=2.4 CAM_DIST=5.2 CAM_YAW=2.3 CAM_PITCH=0.1 node tools/mirror_capture.mjs /tmp/crash && .venv/bin/python tools/mirror_shade.py /tmp/crash /tmp/crash.png"
+    "crash": "SCENARIO=crash IMPACT=100 CRASH_T=2.4 CAM_DIST=5.2 CAM_YAW=2.3 CAM_PITCH=0.1 node tools/mirror_capture.mjs /tmp/crash && .venv/bin/python tools/mirror_shade.py /tmp/crash /tmp/crash.png",
+    "test:panels": "node tests/panels_test.mjs",
+    "car": "python3 tools/fbx2glb_parts.py Volvo_S90_optimized.fbx game/assets/volvo.glb"
   },
   "license": "MIT"
 }

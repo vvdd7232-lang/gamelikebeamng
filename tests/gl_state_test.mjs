@@ -146,7 +146,7 @@ global.window = { devicePixelRatio: 1, addEventListener() {}, getGamepads: () =>
 global.document = { getElementById: () => null };
 global.performance = global.performance || { now: () => Date.now() };
 
-const glb = parseGlbForNode(new Uint8Array(fs.readFileSync(new URL('../game/assets/tesla.glb', import.meta.url))));
+const glb = parseGlbForNode(new Uint8Array(fs.readFileSync(new URL('../game/assets/volvo.glb', import.meta.url))));
 const world = new World(1337);
 const probe = new Vehicle(world, { spawn: world.spawnOnTrack(0) });
 const geom = buildCarGeometry(glb, probe.cage.nodes);

@@ -36,7 +36,7 @@ async function main() {
   }
 
   loadingText.textContent = 'loading car model…';
-  const glb = await loadGlb('assets/tesla.glb');
+  const glb = await loadGlb('assets/volvo.glb');
 
   loadingText.textContent = 'building terrain…';
   await new Promise((r) => setTimeout(r, 16));
@@ -219,6 +219,16 @@ async function main() {
           }
           if (v.isPlayer) hud.toast('wheel torn off', 1200);
         }
+        // body panels that just left the car: a puff of dust and a toast
+        const lost = v.takeDetachedPanels ? v.takeDetachedPanels() : [];
+        for (const q of lost) {
+          for (let i = 0; i < 10; i++) {
+            effects.spawnParticle(q.pos[0], q.pos[1], q.pos[2],
+              (Math.random() - 0.5) * 3, Math.random() * 2.2, (Math.random() - 0.5) * 3,
+              0.4 + Math.random(), 0.22, [0.42, 0.12, 0.10], -4, 1.2);
+          }
+          if (v.isPlayer) hud.toast(`${q.name.replace(/_/g, ' ').toLowerCase()} torn off`, 1200);
+        }
       }
       for (const v of cars) effects.carEffects(v, dt, v.speed);
       effects.update(dt);
@@ -246,6 +256,9 @@ async function main() {
       powerScale: player.powerScale,
       wheelDamage: player.wheelDamage,
       wheelRim: player.wheels.map((w) => w.detached ? 1 : (w.rimDamage || 0)),
+      detached: player.wheels.filter((w) => w.detached).length,
+      lostPanels: (player.detachedPanels || []).map((q) => q.name),
+      loosePanels: (player.panels || []).filter((q) => !q.detached && q.loose > 0.5).length,
       impact: hitPower > 0.1 ? player.lastImpactSpeed : 0,
       gears: 1,
       fps: clock.fps,

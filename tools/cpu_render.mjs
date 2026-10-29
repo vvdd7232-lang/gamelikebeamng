@@ -7,7 +7,7 @@ import { Vehicle } from '../game/src/vehicle/vehicle.js';
 import { buildCarGeometry } from '../game/src/vehicle/carMesh.js';
 import { Camera } from '../game/src/game/camera.js';
 
-const glbBuffer = new Uint8Array(fs.readFileSync(new URL('../game/assets/tesla.glb', import.meta.url)));
+const glbBuffer = new Uint8Array(fs.readFileSync(new URL('../game/assets/volvo.glb', import.meta.url)));
 const { parseGlbForNode } = await import('../tests/glb_node.mjs');
 const glb = parseGlbForNode(glbBuffer);
 

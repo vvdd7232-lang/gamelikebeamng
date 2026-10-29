@@ -1,6 +1,13 @@
 // Minimal DOM HUD: speedometer, live damage map, help panel, toasts.
 
 /** green -> amber -> red -> dead */
+function panelLabel(name) {
+  return String(name).replace(/_/g, ' ').toUpperCase()
+    .replace('BUMPER FRONT', 'FRONT BUMPER')
+    .replace('BUMPER REAR', 'REAR BUMPER')
+    .replace('DOOR', 'DOOR');
+}
+
 function damageColor(v) {
   // v = 0 (pristine) .. 1 (destroyed)
   if (v < 0.34) {
@@ -118,9 +125,18 @@ export class HUD {
       }
     }
     if (this.el.wheelDamage) {
-      this.el.wheelDamage.textContent = d.detached > 0
-        ? `${d.detached} WHEEL${d.detached > 1 ? 'S' : ''} LOST`
-        : (d.wheelRim && Math.max(...d.wheelRim) > 0.45 ? 'WHEEL DAMAGE' : '');
+      const bits = [];
+      if (d.detached > 0) bits.push(`${d.detached} WHEEL${d.detached > 1 ? 'S' : ''} LOST`);
+      else if (d.wheelRim && Math.max(...d.wheelRim) > 0.45) bits.push('WHEEL DAMAGE');
+      // body panels that are no longer attached to the car
+      const lost = d.lostPanels || [];
+      if (lost.length) {
+        bits.push(lost.length === 1 ? `${panelLabel(lost[0])} OFF`
+          : `${lost.length} PANELS OFF`);
+      } else if (d.loosePanels > 0) {
+        bits.push('PANEL HANGING');
+      }
+      this.el.wheelDamage.textContent = bits.join(' · ');
     }
 
     // ---- impact feedback: flash the panel, show how hard the hit was

@@ -17,7 +17,7 @@ import { Vehicle } from '../game/src/vehicle/vehicle.js';
 import { buildCarGeometry } from '../game/src/vehicle/carMesh.js';
 import { parseGlbForNode } from './glb_node.mjs';
 
-const glb = parseGlbForNode(new Uint8Array(fs.readFileSync(new URL('../game/assets/tesla.glb', import.meta.url))));
+const glb = parseGlbForNode(new Uint8Array(fs.readFileSync(new URL('../game/assets/volvo.glb', import.meta.url))));
 const world = new World(1337);
 const car = new Vehicle(world, { spawn: world.spawnOnTrack(0.02), isPlayer: true });
 

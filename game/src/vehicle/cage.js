@@ -1,28 +1,29 @@
 // Builds the soft-body node cage + beams from the generated cage data.
 // Shared by the physics and by the mesh skinning so node indices always match.
 
-import { CAGE } from './tesla_nodes.js';
+import { CAGE } from './car_nodes.js';
 
-// Geometry is taken straight from the model: the wheel centre sits at local
-// y = 0.3599 and the tyre radius is 0.3576, the underbody at y = 0.0997.
-const WHEEL_CENTRE_Y = 0.3599;
+// Geometry is taken straight from the model (Volvo S90): the wheel centres sit
+// at y = 0.359 and the tyre radius is 0.36, the shell is 5.00 m long and 2.01 m
+// wide, and the roof tops out at 1.43 m.
+const WHEEL_CENTRE_Y = 0.359;
 
 export const CAR = {
-  wheelRadius: 0.3576,
-  wheelWidth: 0.28,
-  halfTrackFront: 0.8061,
-  halfTrackRear: 0.8403,
-  axleFront: 1.5696,
-  axleRear: -1.4137,
+  wheelRadius: 0.36,
+  wheelWidth: 0.25,
+  halfTrackFront: 0.816,
+  halfTrackRear: 0.8135,
+  axleFront: 1.61,
+  axleRear: -1.33,
   // cage is lifted slightly so the floor has ground clearance at ride height
   cageLift: 0.0,
   suspRest: 0.13,
   suspTravel: 0.14,
   // attach point (top of the strut) in car space
   hubY: WHEEL_CENTRE_Y + 0.13,
-  length: 4.99,
-  width: 2.19,
-  height: 1.44,
+  length: 5.0,
+  width: 2.012,
+  height: 1.43,
 };
 // distance from the car origin down to the tyre contact patch at rest load
 CAR.staticComp = 0.044;
@@ -75,10 +76,10 @@ const ZONES = {
     // yield sits above the strain gravity puts into the front overhang, so a
     // parked car never slowly "yields"; the crush limits below still let a hit
     // fold the clip right up
-    k: 0.5, yield: [1.45, 1.15], break: [3.20, 4.20], force: 80.0, plastic: 1.6, damageLoss: 0.6,
+    k: 0.5, yield: [1.45, 1.15], break: [1.90, 2.40], force: 80.0, plastic: 2.4, damageLoss: 0.6,
     // the clip folds up like a concertina and stays attached to the car; it
     // only tears off in a really violent hit
-    setC: 0.66, setT: 0.70,
+    setC: 0.78, setT: 0.70,
   },
   cabin: {
     k: 1.12, yield: [2.10, 1.70], break: [1.55, 1.30], force: 2.40, plastic: 0.45, damageLoss: 0.32,
@@ -95,10 +96,10 @@ const ZONES = {
 /** which crush zone a beam midpoint belongs to */
 function zoneOf(z, y) {
   // the roof rails over the passenger cell are always part of the cage
-  if (y > 0.98) return 'cabin';
-  if (z > 1.25) return 'crumple';
-  if (z < -1.45) return 'crumple';
-  if (z > 0.85 || z < -1.05) return 'boundary';
+  if (y > 1.00) return 'cabin';
+  if (z > 1.32) return 'crumple';
+  if (z < -1.58) return 'crumple';
+  if (z > 0.92 || z < -1.18) return 'boundary';
   return 'cabin';
 }
 

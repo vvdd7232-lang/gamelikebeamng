@@ -71,6 +71,9 @@ console.log('normal driving:');
   check(car.wheels.every((w) => !w.detached), 'no wheel falls off while driving');
   check(startZones.every((v) => v < 0.01), 'panels start undamaged');
   check(car.powerScale > 0.95, 'power stays at 100%');
+  check(car.panels.every((p) => !p.detached), 'no door falls off from driving');
+  check(car.panels.every((p) => Math.abs(p.angle) < 0.05), 'panel latches hold under normal driving');
+  check(car.panels.length >= 6, `the body is built from ${car.panels.length} separate panels`);
 }
 
 // ---------------------------------------------------------------- light tap
@@ -112,6 +115,22 @@ console.log('100 km/h into a concrete barrier:');
     run(car, 1.0, IDLE);
     check(Number.isFinite(w.pos[1]) && Math.abs(w.pos[1] - y0) < 5, 'the loose wheel keeps flying / settling, not teleporting');
   }
+  // body panels: the nose takes the hit, so the hood and the front bumper are
+  // the pieces that leave the car; the rear of the shell is untouched
+  const gone = car.detachedPanels.map((p) => p.name);
+  check(gone.length > 0, `panels torn off (${gone.join(', ') || 'none'})`);
+  check(gone.includes('Hood') || gone.includes('Bumper_Front'), 'the front end loses its skin, not the roof');
+  const rear = car.panels.filter((p) => /_R[LR]$/.test(p.name) || p.name === 'Trunk');
+  check(rear.every((p) => !p.detached), 'the back of the car keeps its panels in a frontal hit');
+  for (const p of car.detachedPanels) {
+    check(Array.isArray(p.vel) && Array.isArray(p.quat) && p.radius > 0, `${p.name} flies as its own body`);
+  }
+  const p0 = car.detachedPanels[0];
+  const y0 = p0 ? p0.pos[1] : 0;
+  run(car, 1.2, IDLE);
+  if (p0) {
+    check(Number.isFinite(p0.pos[1]) && p0.pos[1] < y0 + 6, `${p0.name} lands instead of flying to infinity`);
+  }
   // damage is permanent: it must not heal as the car sits still
   const before = car.damage;
   run(car, 3, IDLE);
@@ -128,6 +147,19 @@ console.log('repair (R):');
   check(car.wheels.every((w) => !w.detached), 'reset puts the wheels back');
   check(car.body.brokenCount === 0, 'reset welds every beam');
   check(car.powerScale > 0.99 && car.cabinIntegrity > 0.99, 'reset clears the derived damage');
+  check(car.detachedPanels.length === 0, 'reset puts the panels back');
+  check(car.panels.every((p) => !p.detached && Math.abs(p.angle) < 1e-6), 'reset re-hangs every panel straight');
+}
+
+// ---------------------------------------------------------------- panels at rest
+console.log('parked car:');
+{
+  const car = new Vehicle(world, { spawn: SPAWN });
+  run(car, 6, IDLE);
+  const creep = car.panels.map((p) => Math.abs(p.angle));
+  check(Math.max(...creep) < 0.02,
+    `the latches carry the panels (max sag ${(Math.max(...creep) * 57.3).toFixed(1)} deg)`);
+  check(car.panels.every((p) => !p.detached), 'nothing falls off a parked car');
 }
 
 // ---------------------------------------------------------------- soft body

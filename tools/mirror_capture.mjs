@@ -182,7 +182,7 @@ const { Effects } = await import('../game/src/fx/effects.js');
 const { Camera } = await import('../game/src/game/camera.js');
 const { parseGlbForNode } = await import('../tests/glb_node.mjs');
 
-const glb = parseGlbForNode(new Uint8Array(fs.readFileSync(new URL('../game/assets/tesla.glb', import.meta.url))));
+const glb = parseGlbForNode(new Uint8Array(fs.readFileSync(new URL('../game/assets/volvo.glb', import.meta.url))));
 const canvas = { width: 1280, height: 720, getContext: () => makeGL(canvas), addEventListener() {} };
 const renderer = new Renderer(canvas);
 renderer.resize(1280, 720);
@@ -324,6 +324,7 @@ fs.writeFileSync(path.join(outDir, 'frame.json'), JSON.stringify({
     speedKmh: player.forwardSpeed * 3.6,
     damage: player.damage,
     detached: player.wheels.map((w) => w.detached),
+    panels: (player.panels || []).map((p) => `${p.name}:${p.detached ? 'OFF' : p.angle.toFixed(2)}`).join(' '),
   },
 }, null, 1));
 console.log(`captured ${draws.length} draw calls -> ${outDir}`);

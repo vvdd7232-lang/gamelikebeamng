@@ -77,7 +77,7 @@ global.performance = global.performance || { now: () => Date.now() };
 
 const canvas = { width: 1280, height: 720, getContext: () => makeGL(canvas), addEventListener() {} };
 
-const glbBuffer = new Uint8Array(fs.readFileSync(new URL('../game/assets/tesla.glb', import.meta.url)));
+const glbBuffer = new Uint8Array(fs.readFileSync(new URL('../game/assets/volvo.glb', import.meta.url)));
 const { parseGlbForNode } = await import('./glb_node.mjs');
 const glb = parseGlbForNode(glbBuffer);
 
